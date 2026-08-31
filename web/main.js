@@ -1779,7 +1779,7 @@ function syncProviderSettings() {
     panel.hidden = panel.dataset.providerPanel !== provider;
   });
   const runtimeSettings = studio.root.querySelector(".h3ps-runtime-settings");
-  runtimeSettings.hidden = provider !== "direct";
+  runtimeSettings.hidden = provider !== "direct" && provider !== "api";
 }
 
 function directModelRuntimeSuffix(model) {
@@ -2064,7 +2064,12 @@ function syncAdvancedRuntimeControls() {
   const budgetSupported = direct || studio.selectedModel?.family === "api";
   const advanced = studio.root.querySelector("[data-direct-runtime-advanced]");
   advanced.hidden = !budgetSupported;
+  studio.root.querySelector("[data-context-control]").hidden = !direct;
   studio.root.querySelector("[data-kv-cache-control]").hidden = !direct;
+  const management = studio.root.querySelector("[data-runtime-management]");
+  management.textContent = studio.selectedModel?.family === "api"
+    ? "Generation budget is applied to the next request. Context and KV cache are managed by the API provider."
+    : "Direct GGUF runtime settings are applied to the next request.";
   const customContext = studio.root.querySelector("[data-custom-context]");
   customContext.hidden = !direct || studio.contextProfile !== "custom";
   const contextInput = studio.root.querySelector("[data-custom-context-input]");

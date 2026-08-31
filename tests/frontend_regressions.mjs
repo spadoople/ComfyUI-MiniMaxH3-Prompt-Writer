@@ -726,6 +726,7 @@ test("Generate and Refine payloads are built from state rather than Settings DOM
   assert.equal(apiPayload.ollama_model, null);
   assert.equal(apiPayload.generation_budget, 4096);
   assert.match(mainSource, /const budgetSupported = direct \|\| studio\.selectedModel\?\.family === "api";/);
+  assert.match(mainSource, /runtimeSettings\.hidden = provider !== "direct" && provider !== "api";/);
 
   selectModelState(state, { id: "direct.gguf", family: "gguf", capabilities: { audio: false } });
   state.contextProfile = "custom";
