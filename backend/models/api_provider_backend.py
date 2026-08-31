@@ -665,6 +665,7 @@ class ApiProviderBackend:
         context_profile: str | None,
         kv_cache: str | None,
         thinking: bool,
+        generation_budget: int | None = None,
     ) -> dict[str, Any]:
         if (context_profile or "auto").lower() != "auto" or (kv_cache or "auto").lower() != "auto":
             raise ModelError(
@@ -689,7 +690,13 @@ class ApiProviderBackend:
             estimated_input_tokens + THINKING_OUTPUT_TOKENS + CONTEXT_SAFETY_TOKENS,
         )
         standard_output_tokens = non_thinking_output_tokens(assembled)
-        desired_output = THINKING_OUTPUT_TOKENS if thinking else standard_output_tokens
+        if generation_budget is not None and (
+            not isinstance(generation_budget, int)
+            or isinstance(generation_budget, bool)
+            or generation_budget <= 0
+        ):
+            raise ModelError("INVALID_GENERATION_BUDGET", "Generation budget must be a positive integer number of tokens.")
+        desired_output = generation_budget or (THINKING_OUTPUT_TOKENS if thinking else standard_output_tokens)
         provider_max_output = model_info.get("max_output_tokens")
         if isinstance(provider_max_output, int) and provider_max_output > 0:
             desired_output = min(desired_output, provider_max_output)
@@ -718,6 +725,7 @@ class ApiProviderBackend:
             "visual_input_count": visual_input_count,
             "max_output_tokens": max_output_tokens,
             "reserved_output_tokens": max_output_tokens + CONTEXT_SAFETY_TOKENS,
+            "generation_budget_manual": generation_budget is not None,
             "thinking_budget_reduced": thinking and max_output_tokens < THINKING_OUTPUT_TOKENS,
             "context_limit_known": known_context is not None,
         }
@@ -847,6 +855,7 @@ class ApiProviderBackend:
         unload_after: bool,
         context_profile: str | None = None,
         kv_cache: str | None = None,
+        generation_budget: int | None = None,
         runtime_plan: dict[str, Any] | None = None,
         on_phase: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
@@ -860,6 +869,7 @@ class ApiProviderBackend:
                 context_profile=context_profile,
                 kv_cache=kv_cache,
                 thinking=thinking,
+                generation_budget=generation_budget,
             )
             self.model_id = model_info["id"]
             try:

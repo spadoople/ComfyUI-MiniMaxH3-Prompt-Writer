@@ -1984,6 +1984,9 @@ function rememberRuntimePreferences(provider = studio.settingsProvider) {
     studio.directGenerationBudget = studio.generationBudget;
     studio.directGenerationBudgetTokens = studio.generationBudgetTokens;
     studio.directReasoningEffort = studio.reasoningEffort;
+  } else if (provider === "api") {
+    studio.directGenerationBudget = studio.generationBudget;
+    studio.directGenerationBudgetTokens = studio.generationBudgetTokens;
   }
 }
 
@@ -1995,6 +1998,13 @@ function applyRuntimePreferences(provider) {
     studio.generationBudget = studio.directGenerationBudget;
     studio.generationBudgetTokens = studio.directGenerationBudgetTokens;
     studio.reasoningEffort = studio.directReasoningEffort;
+  } else if (provider === "api") {
+    studio.contextProfile = "auto";
+    studio.contextTokens = null;
+    studio.kvCache = "auto";
+    studio.generationBudget = studio.directGenerationBudget;
+    studio.generationBudgetTokens = studio.directGenerationBudgetTokens;
+    studio.reasoningEffort = "auto";
   } else {
     studio.contextProfile = "auto";
     studio.contextTokens = null;
@@ -2051,8 +2061,10 @@ function syncContextAvailability() {
 
 function syncAdvancedRuntimeControls() {
   const direct = studio.selectedModel?.family === "gguf";
+  const budgetSupported = direct || studio.selectedModel?.family === "api";
   const advanced = studio.root.querySelector("[data-direct-runtime-advanced]");
-  advanced.hidden = !direct;
+  advanced.hidden = !budgetSupported;
+  studio.root.querySelector("[data-kv-cache-control]").hidden = !direct;
   const customContext = studio.root.querySelector("[data-custom-context]");
   customContext.hidden = !direct || studio.contextProfile !== "custom";
   const contextInput = studio.root.querySelector("[data-custom-context-input]");
@@ -2062,7 +2074,7 @@ function syncAdvancedRuntimeControls() {
   else contextInput.removeAttribute("max");
 
   const customBudget = studio.root.querySelector("[data-custom-generation-budget]");
-  customBudget.hidden = !direct || studio.generationBudget !== "custom";
+  customBudget.hidden = !budgetSupported || studio.generationBudget !== "custom";
   studio.root.querySelector("[data-custom-generation-budget-input]").value = studio.generationBudgetTokens || "";
 
   const values = direct ? (studio.selectedModel?.reasoning_effort_values || []) : [];

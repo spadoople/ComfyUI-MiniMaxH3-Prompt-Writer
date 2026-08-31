@@ -499,6 +499,16 @@ class ApiProviderBackendTests(unittest.TestCase):
         self.assertEqual(plan["kv_cache"], "provider")
         self.assertEqual(plan["context_profile"], "provider")
         self.assertEqual(plan["max_output_tokens"], 2_048)
+        manual_budget_plan = self.backend.preflight(
+            model,
+            assembled,
+            context_profile="auto",
+            kv_cache="auto",
+            thinking=False,
+            generation_budget=4_096,
+        )
+        self.assertEqual(manual_budget_plan["max_output_tokens"], 4_096)
+        self.assertTrue(manual_budget_plan["generation_budget_manual"])
         music_plan = self.backend.preflight(
             model,
             {**assembled, "input": {"mode": "Music3"}},

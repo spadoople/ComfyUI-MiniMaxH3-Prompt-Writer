@@ -347,10 +347,11 @@ async def _prepare_generation_runtime(
         "kv_cache": body.get("kv_cache", "auto"),
         "thinking": body.get("thinking", False),
     }
+    if model["family"] in {"gguf", "api"}:
+        runtime_options["generation_budget"] = body.get("generation_budget")
     if model["family"] == "gguf":
         runtime_options.update({
             "context_tokens": body.get("context_tokens"),
-            "generation_budget": body.get("generation_budget"),
             "reasoning_effort": body.get("reasoning_effort", "auto"),
         })
     runtime_plan, cancellation = await _run_thread_worker(
@@ -675,6 +676,7 @@ async def generate(request: web.Request) -> web.Response:
             unload_after=body.get("unload_after", True),
             context_profile=body.get("context_profile", "auto"),
             kv_cache=body.get("kv_cache", "auto"),
+            **({"generation_budget": body.get("generation_budget")} if model["family"] == "api" else {}),
             runtime_plan=runtime_plan,
             on_phase=on_phase,
         )

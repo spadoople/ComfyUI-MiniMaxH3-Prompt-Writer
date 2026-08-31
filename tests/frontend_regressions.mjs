@@ -719,10 +719,13 @@ test("Generate and Refine payloads are built from state rather than Settings DOM
     capabilities: { audio: false, images: true },
   };
   selectModelState(state, apiModel);
+  state.generationBudget = "4096";
   const apiPayload = buildGeneratePayload(state, { creativeBrief: "A quiet shot.", seed: 3407 });
   assert.deepEqual(apiPayload.api_provider, { connection_id: "connection-id", model_id: "provider/model" });
   assert.equal(apiPayload.external_server, null);
   assert.equal(apiPayload.ollama_model, null);
+  assert.equal(apiPayload.generation_budget, 4096);
+  assert.match(mainSource, /const budgetSupported = direct \|\| studio\.selectedModel\?\.family === "api";/);
 
   selectModelState(state, { id: "direct.gguf", family: "gguf", capabilities: { audio: false } });
   state.contextProfile = "custom";

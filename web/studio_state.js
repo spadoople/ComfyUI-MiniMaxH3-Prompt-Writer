@@ -306,6 +306,7 @@ export function restoredModelAfterDiscovery(state) {
 
 function sharedInferencePayload(state) {
   const directRuntime = state.selectedModel?.family === "gguf";
+  const apiRuntime = state.selectedModel?.family === "api";
   const thinking = state.selectedModel?.family === "external" ? false : state.thinking;
   const generationBudgetMode = state.generationBudget || "auto";
   const generationBudget = generationBudgetMode === "custom"
@@ -324,8 +325,8 @@ function sharedInferencePayload(state) {
     kv_cache: directRuntime ? state.kvCache : "auto",
     ...(directRuntime ? {
       context_tokens: state.contextProfile === "custom" ? state.contextTokens : null,
-      generation_budget: generationBudget,
     } : {}),
+    ...(directRuntime || apiRuntime ? { generation_budget: generationBudget } : {}),
     ...(directRuntime && thinking ? { reasoning_effort: state.reasoningEffort || "auto" } : {}),
     system_prompt_override: currentSystemPromptOverride(state),
     unload_after: !state.keepModelLoaded,
@@ -334,6 +335,7 @@ function sharedInferencePayload(state) {
 
 export function buildGeneratePayload(state, { creativeBrief, lyrics = "", seed }) {
   const directRuntime = state.selectedModel?.family === "gguf";
+  const apiRuntime = state.selectedModel?.family === "api";
   const thinking = state.selectedModel?.family === "external" ? false : state.thinking;
   const generationBudgetMode = state.generationBudget || "auto";
   const generationBudget = generationBudgetMode === "custom"
@@ -355,8 +357,8 @@ export function buildGeneratePayload(state, { creativeBrief, lyrics = "", seed }
     kv_cache: directRuntime ? state.kvCache : "auto",
     ...(directRuntime ? {
       context_tokens: state.contextProfile === "custom" ? state.contextTokens : null,
-      generation_budget: generationBudget,
     } : {}),
+    ...(directRuntime || apiRuntime ? { generation_budget: generationBudget } : {}),
     ...(directRuntime && thinking ? { reasoning_effort: state.reasoningEffort || "auto" } : {}),
     system_prompt_override: currentSystemPromptOverride(state),
     seed,
