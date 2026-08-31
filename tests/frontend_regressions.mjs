@@ -1057,6 +1057,16 @@ test("active requests block add, reorder, and mode switching", () => {
   assert.match(mainSource, /const unavailable = !isGenerationModeAvailable[\s\S]{0,180}control\.disabled = studio\.requestBusy \|\| unavailable/);
 });
 
+test("Reference mode can import its ordered LoadImage inputs from Reference Inference Desk", () => {
+  assert.match(mainSource, /data-import-workflow-references/);
+  assert.match(mainSource, /function workflowReferenceFilenames\(\)/);
+  assert.match(mainSource, /ReferenceVisionInference/);
+  assert.match(mainSource, /match\(\/\^image_\(\\d\+\)\$\/\)/);
+  assert.match(mainSource, /widgetValue\(source, "image"\)/);
+  assert.match(mainSource, /sort\(\(left, right\) => left\.slot - right\.slot\)/);
+  assert.match(mainSource, /importComfyInputMedia\(studio\.sessionId, "Reference", filenames\)/);
+});
+
 test("text-only Direct UI disables visual and Music modes and explains the fallback", () => {
   assert.match(mainSource, /function syncModeAvailability\(\)/);
   assert.match(mainSource, /data-workspace[\s\S]{0,220}control\.dataset\.workspace === "music"/);

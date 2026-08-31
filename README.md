@@ -49,6 +49,7 @@ Writer sends your brief, selected mode, prepared references, and the official Mi
 - Up to 9 images, 3 videos, and 3 audio references in Reference mode.
 - Clear `<Picture N>`, `<Video N>`, and `<Audio N>` labels for assigning identity, wardrobe, setting, motion, camera, sound, or other roles.
 - In-place Reference media replacement from the card action or by dropping one file directly on a card, without rebuilding the surrounding asset order.
+- **Import workflow images** in Reference mode: copies the ordered `LoadImage` inputs connected to one Reference Inference Desk node, so the same images can be used without uploading them again.
 - Ordered video contact sheets with visible frame-sampling controls, so you can inspect what the prompt model sees.
 - Official MiniMax base and Reference guides included for all five modes.
 - Editable prompts, **Refine**, **Copy prompt**, and a separate saved draft for every mode.

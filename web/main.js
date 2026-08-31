@@ -1,5 +1,5 @@
 import { app } from "/scripts/app.js";
-import { cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, resampleMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
+import { cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, importComfyInputMedia, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, resampleMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
 import { availableReferenceTags, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
 import { generateModelSummaryMarkup, settingsMarkup } from "./settings.js";
 import {
@@ -423,6 +423,7 @@ function renderMedia(mode) {
         <button type="button" data-media-filter="image" class="${filter === "image" ? "is-active" : ""}">${icon("image", 13)} Images <b>${counts.image || 0}/9</b></button>
         <button type="button" data-media-filter="video" class="${filter === "video" ? "is-active" : ""}">${icon("video", 13)} Video <b>${counts.video || 0}/3</b></button>
         <button type="button" data-media-filter="audio" class="${filter === "audio" ? "is-active" : ""}">${icon("audio", 13)} Audio <b>${counts.audio || 0}/3</b></button>
+        <button type="button" data-import-workflow-references ${studio.requestBusy ? "disabled" : ""}>Import workflow images</button>
       </div>` : "";
     const addLabel = !isReference || filter === "image" ? "Add image" : filter === "video" ? "Add video" : filter === "audio" ? "Add audio" : "Add media";
     const canAdd = isReference || assets.length < data.limit;
@@ -567,6 +568,9 @@ function bindMediaActions(mode) {
   studio.root.querySelectorAll("[data-add-media]").forEach((button) => {
     button.addEventListener("click", () => chooseMedia(mode));
   });
+  studio.root.querySelectorAll("[data-import-workflow-references]").forEach((button) => {
+    button.addEventListener("click", () => importWorkflowReferences());
+  });
   studio.root.querySelectorAll("[data-asset-id]").forEach((card) => {
     card.addEventListener("dragstart", (event) => {
       if (studio.requestBusy) {
@@ -686,6 +690,50 @@ async function uploadFiles(mode, files, replaceAssetId = null) {
   } catch (error) {
     renderMedia(mode);
     showToast(error.code || "Upload failed", error.message, error.details);
+  }
+}
+
+function widgetValue(node, name) {
+  const widget = node?.widgets?.find((item) => item.name === name);
+  return typeof widget?.value === "string" ? widget.value : null;
+}
+
+function workflowReferenceFilenames() {
+  const graph = app.graph;
+  const nodes = graph?._nodes || [];
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const candidates = nodes.map((target) => {
+    const type = target.comfyClass || target.type || "";
+    if (!String(type).includes("ReferenceVisionInference")) return [];
+    return (target.inputs || []).flatMap((input) => {
+      const slot = String(input?.name || "").match(/^image_(\d+)$/);
+      const link = input?.link == null ? null : graph.links?.[input.link];
+      const source = link ? nodeById.get(link.origin_id) : null;
+      const filename = widgetValue(source, "image");
+      return slot && filename ? [{ slot: Number(slot[1]), filename }] : [];
+    }).sort((left, right) => left.slot - right.slot);
+  }).filter((references) => references.length);
+  if (candidates.length !== 1) {
+    throw new Error(candidates.length
+      ? "Found multiple Reference Inference Desk nodes. Keep one connected reference set in this workflow before importing."
+      : "No directly connected LoadImage references were found on a Reference Inference Desk node.");
+  }
+  return candidates[0].map((reference) => reference.filename);
+}
+
+async function importWorkflowReferences() {
+  if (studio.requestBusy || studio.mode !== "Reference") return;
+  try {
+    const filenames = workflowReferenceFilenames();
+    showToast("Importing workflow images", `Copying ${filenames.length} ordered reference image${filenames.length === 1 ? "" : "s"}…`);
+    const result = await importComfyInputMedia(studio.sessionId, "Reference", filenames);
+    studio.sessionId = result.session_id;
+    studio.assets = [...studio.assets, ...result.assets];
+    renderMedia("Reference");
+    hideToast();
+  } catch (error) {
+    renderMedia("Reference");
+    showToast(error.code || "Workflow import failed", error.message);
   }
 }
 

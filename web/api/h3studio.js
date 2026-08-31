@@ -56,6 +56,11 @@ export function uploadMedia(sessionId, mode, files, replaceAssetId = null) {
   return request(`/media/upload${replace}`, { method: "POST", body });
 }
 
+export const importComfyInputMedia = (sessionId, mode, filenames) => post(
+  "/media/import-comfy-input",
+  { session_id: sessionId, mode, filenames },
+);
+
 export const listMedia = (sessionId) => request(`/media?session_id=${encodeURIComponent(sessionId)}`);
 export const removeMedia = (sessionId, assetId) => request(
   `/media/${encodeURIComponent(assetId)}?session_id=${encodeURIComponent(sessionId)}`,
