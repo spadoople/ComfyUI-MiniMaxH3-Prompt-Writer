@@ -2,11 +2,13 @@
 
 Use H3 Prompt Writer without ComfyUI.
 
-Current Standalone version: **0.1.2**
+Current Standalone version: **0.1.10**
 
-[Download H3 Prompt Writer Standalone v0.1.2](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/releases/download/standalone-v0.1.2/H3-Prompt-Writer-Standalone-Windows-v0.1.2.zip)
+[Download H3 Prompt Writer Standalone v0.1.10](../../../releases/download/standalone-v0.1.10/H3-Prompt-Writer-Standalone-Windows-v0.1.10.zip)
 
 ## This is the Standalone version
+
+[Sequence mode](../docs/USAGE.md#sequence) writes several standalone Official H3 or Compact descriptive prompts from one brief. Set chunk durations, assign First, Last, or Reference media, then generate and refine each part.
 
 You do not need ComfyUI. Do not install this ZIP into ComfyUI `custom_nodes`.
 
@@ -39,6 +41,65 @@ over the same folder.
 The Writer opens directly in a full-window browser view. Close the browser tab or
 window normally.
 
+### Optional: install as a browser app
+
+This is optional. The normal way to use Writer is to run `start.bat` and work in
+the browser tab it opens; no browser app installation is required.
+
+In a Chromium-based browser that supports installing web apps, use the browser's
+install option to open Writer in its own window and pin it to the taskbar.
+This does not start the Python server: run `start.bat` first and keep its console
+open while using Writer.
+
+The installed app remembers the server address and port (normally
+`http://127.0.0.1:8765/`). If that port is occupied, Standalone opens on another port;
+the installed shortcut still points to the old address. Free the usual port and
+restart Standalone, or use the new browser URL printed in the console.
+
+### Linux
+
+Standalone also runs on Linux using the same Python backend and browser-based interface.
+
+When running Standalone from a repository checkout, use the included Linux launcher:
+
+```bash
+chmod +x start-linux.sh
+./start-linux.sh
+```
+
+For Local GGUF, point it to your Linux `llama-server` executable:
+
+```bash
+H3_LLAMA_SERVER="/path/to/llama-server" ./start-linux.sh
+```
+
+You can also provide model paths on first launch:
+
+```bash
+H3_MODEL_ROOT="/path/to/models" \
+H3_MODEL="/path/to/model.gguf" \
+H3_PROJECTOR="/path/to/mmproj.gguf" \
+./start-linux.sh
+```
+
+Python 3.10 or newer is required. The Linux launcher has been tested on WSL2.
+
+## What's new in v0.1.9
+
+- Install Writer as a browser app in a supported Chromium-based browser, with its own window and taskbar icon. Thanks to @kaalibro (#35).
+
+Start Standalone with `start.bat` first; the installed app needs the local server running at the same address.
+
+See [Sequence usage](../docs/USAGE.md#sequence) for media scope, refinement, and limitations. Media Composer, Media Editor, themes, and provider settings remain available.
+
+Open a media card to edit it. In Reference mode, use **Actions → Compose** to create
+a collage from existing Pictures and video sheets. Editing does not overwrite your
+original files.
+
+The floating Media panel, Add to workflow, and Auto VRAM management are ComfyUI
+features and are not included in Standalone. Model unload controls remain available
+for supported providers.
+
 ## Providers
 
 ### Ollama
@@ -53,12 +114,12 @@ current Writer session and are not saved by Standalone.
 
 ### External llama.cpp
 
-Connect to a `llama-server` that you already started. The external server owns model
-loading, context, KV cache, and shutdown.
+Connect to a `llama-server` that you already started. Compatible routers let you
+select and unload models from Writer. Context and KV cache remain server-managed.
 
 ### Local GGUF
 
-Standalone can start and stop a user-supplied `llama-server.exe` for existing GGUF
+Standalone can start and stop a user-supplied `llama-server` executable for existing GGUF
 models:
 
 1. Download the appropriate Windows archive from the official
@@ -70,7 +131,7 @@ models:
 
 Use **Locations · N** to see remembered model folders, forget one, or forget all.
 Forgetting a location never deletes files. Use the runtime card's **Manage** menu to
-change or forget `llama-server.exe`.
+change or forget the `llama-server` executable.
 
 Model and projector roles are read from GGUF metadata, not filenames. Unknown files
 remain selectable as **Unverified**. If several projectors match, Standalone asks you
@@ -80,6 +141,10 @@ Standalone does not guess or download CUDA, CPU, or Vulkan builds. It starts at 
 one managed server on `127.0.0.1`, reuses it while the configuration is unchanged,
 and keeps native runtime failures outside the Writer process. `llama-cpp-python` is
 not used for Local GGUF.
+
+If a Local GGUF connection is interrupted, Technical details includes the server log
+path and an exit code when available. Try generating again; a stopped server is
+started automatically. You do not normally need to restart Windows.
 
 ## Notes
 
@@ -98,6 +163,10 @@ The standalone layer is intentionally small. In this repository it imports the s
 `backend/`, `web/`, guides, and model metadata directly. A portable build vendors a
 clean snapshot of those shared files. Standalone-specific behavior stays in adapter
 files so normal core commits are immediately available to both hosts.
+
+Host capabilities are declared in `h3_standalone/static/app.js`. Keep ComfyUI-only
+actions behind these shared guards, and use Writer's theme and size tokens for
+Standalone controls. CI tests both hosts. The build copies tracked source files only.
 
 Optional development settings live in `data/settings.json`:
 
@@ -122,6 +191,6 @@ From the repository root, build the portable package with:
 powershell -ExecutionPolicy Bypass -File scripts\build_standalone.ps1
 ```
 
-The result is `dist\H3-Prompt-Writer-Standalone-Windows-v0.1.2.zip`. It records the
+The result is `dist\H3-Prompt-Writer-Standalone-Windows-v0.1.10.zip`. It records the
 repository commit in `upstream\UPSTREAM_SNAPSHOT.txt` and excludes local settings,
 logs, models, `llama-server`, CUDA libraries, and test artifacts.

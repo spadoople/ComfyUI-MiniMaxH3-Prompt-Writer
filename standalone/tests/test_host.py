@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import sys
+import io
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
+from aiohttp import FormData
+from PIL import Image
 
 from backend.gguf_metadata import classify_gguf_file
 from backend.models.contract import ModelError
 from h3_standalone.app import create_app
+from h3_standalone import __version__
 from h3_standalone.config import load_settings, validate_upstream
 from h3_standalone.external_backend import _ManagedChatHandler, standalone_external_backend_class
 from h3_standalone.managed_gguf import ManagedGGUFBackend, ManagedGGUFController, managed_runtime_diagnostics
@@ -30,13 +34,37 @@ class StandaloneHostTest(unittest.IsolatedAsyncioTestCase):
     async def test_shell_and_health(self) -> None:
         response = await self.client.get("/")
         self.assertEqual(response.status, 200)
-        self.assertIn("/scripts/boot.js", await response.text())
+        html = await response.text()
+        self.assertIn("/scripts/boot.js", html)
+        self.assertIn('rel="manifest" href="manifest.json"', html)
+        self.assertIn('rel="icon" href="./assets/h3-prompt-writer-launcher.svg"', html)
+
+        response = await self.client.get("/manifest.json")
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["name"], "H3 Prompt Writer")
+        self.assertEqual(payload["display"], "standalone")
+        self.assertEqual(payload["start_url"], "./")
+        png_sizes = set()
+        for icon in payload["icons"]:
+            response = await self.client.get(icon["src"])
+            self.assertEqual(response.status, 200, icon["src"])
+            self.assertEqual(response.content_type, icon["type"])
+            data = await response.read()
+            if icon["type"] == "image/png":
+                with Image.open(io.BytesIO(data)) as image:
+                    size = tuple(int(value) for value in icon["sizes"].split("x"))
+                    self.assertEqual(image.size, size)
+                    png_sizes.add(size)
+            else:
+                self.assertIn(b"<svg", data)
+        self.assertEqual(png_sizes, {(192, 192), (512, 512)})
 
         response = await self.client.get("/healthz")
         payload = await response.json()
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["version"], "0.1.2")
-        self.assertEqual(payload["standalone_version"], "0.1.2")
+        self.assertEqual(payload["version"], __version__)
+        self.assertEqual(payload["standalone_version"], __version__)
         self.assertRegex(payload["core_version"], r"^\d+\.\d+\.\d+$")
 
         response = await self.client.get("/standalone/gguf/state")
@@ -72,16 +100,56 @@ class StandaloneHostTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Forget runtime", script)
         self.assertNotIn("Test / start selected model", script)
 
-        response = await self.client.get("/scripts/standalone_shell.js")
+        response = await self.client.get("/scripts/app.js")
         self.assertEqual(response.status, 200)
         shell = await response.text()
-        self.assertIn("enterStandaloneFullscreen", shell)
-        self.assertIn("keepComfyActionInactive", shell)
+        self.assertIn("h3psHost", shell)
+        self.assertIn("windowed: false", shell)
+        self.assertIn("comfyMemory: false", shell)
+        self.assertIn("workflowMedia: false", shell)
+        for path in ("/media_composer.js", "/media_editor.js", "/styles/tokens.css", "/styles/themes/light.css", "/styles/composer.css", "/styles/editor.css", "/sequence_workspace.js", "/prompt_highlights.js", "/sequence_controller.js", "/api/sequence.js", "/styles/sequence.css"):
+            response = await self.client.get(path)
+            self.assertEqual(response.status, 200, path)
 
         response = await self.client.get("/h3studio/models")
         payload = await response.json()
         self.assertGreater(len(payload["setup"]), 0)
         self.assertTrue(all(item.get("model_url") for item in payload["setup"]))
+
+    async def test_sequence_routes_exist_without_a_comfy_graph(self) -> None:
+        response = await self.client.post("/h3studio/sequence", json={})
+        self.assertEqual(response.status, 400)
+        self.assertIn("INVALID_SEQUENCE", await response.text())
+        response = await self.client.post("/h3studio/sequence/cancel", json={"operation_id": "stale", "session_id": "test"})
+        self.assertEqual(response.status, 200)
+        self.assertFalse((await response.json())["cancelled"])
+
+    async def test_media_editor_and_composer_picture_roundtrip_without_comfyui(self) -> None:
+        session = "22222222-3333-4444-8555-666666666666"
+        image = io.BytesIO()
+        Image.new("RGB", (96, 64), "blue").save(image, "PNG")
+        body = FormData()
+        body.add_field("session_id", session)
+        body.add_field("mode", "Reference")
+        body.add_field("file", image.getvalue(), filename="collage.png", content_type="image/png")
+        response = await self.client.post("/h3studio/media/upload", data=body)
+        self.assertEqual(response.status, 201)
+        asset = (await response.json())["assets"][0]
+        try:
+            response = await self.client.post(f'/h3studio/media/{asset["id"]}/edit', json={
+                "session_id": session, "action": "save", "revision": asset.get("content_revision", 0),
+                "crop": {"x": 0, "y": 0, "w": 32, "h": 32},
+            })
+            self.assertEqual(response.status, 200, await response.text())
+            applied = (await response.json())["assets"][0]
+            self.assertEqual((applied["width"], applied["height"]), (32, 32))
+            response = await self.client.get(applied["content_url"])
+            self.assertEqual(response.status, 200)
+            self.assertEqual(Image.open(io.BytesIO(await response.read())).size, (32, 32))
+            response = await self.client.get(applied["source_url"])
+            self.assertEqual(Image.open(io.BytesIO(await response.read())).size, (96, 64))
+        finally:
+            await self.client.delete(f'/h3studio/media/{asset["id"]}?session_id={session}')
 
 
 class ManagedGGUFTest(unittest.TestCase):
@@ -483,6 +551,9 @@ class ManagedGGUFTest(unittest.TestCase):
             )
             self.assertTrue(started["running"])
             self.assertTrue(started["endpoint"].startswith("http://127.0.0.1:"))
+            command = server._process.args
+            self.assertEqual(command[command.index("--batch-size") + 1], "2048")
+            self.assertEqual(command[command.index("--ubatch-size") + 1], "2048")
             reused = server.start(
                 binary=fixture,
                 model=model,
@@ -491,6 +562,13 @@ class ManagedGGUFTest(unittest.TestCase):
                 kv_cache="q8",
             )
             self.assertTrue(reused["reused"])
+            text_only = server.start(
+                binary=fixture, model=model, projector=None, context_tokens=8192, kv_cache="q8",
+            )
+            self.assertTrue(text_only["running"])
+            self.assertFalse(text_only["reused"])
+            self.assertNotIn("--batch-size", server._process.args)
+            self.assertNotIn("--ubatch-size", server._process.args)
             self.assertTrue(server.stop()["stopped"])
             self.assertFalse(server.status()["running"])
             # Windows can release an inherited redirected-file handle a moment

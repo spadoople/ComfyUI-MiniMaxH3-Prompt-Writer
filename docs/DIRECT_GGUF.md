@@ -23,7 +23,7 @@ Workflow safetensors, checkpoints, and text encoders are unrelated to the Direct
 Open PowerShell or Command Prompt in the ComfyUI Portable folder that contains `python_embeded`, then run:
 
 ```powershell
-.\python_embeded\python.exe -m pip install --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130 "llama-cpp-python>=0.3.35,<0.4"
+.\python_embeded\python.exe -m pip install --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130 "llama-cpp-python==0.3.35"
 ```
 
 Restart ComfyUI and open **H3 Prompt Writer > Settings > Direct GGUF**. Settings shows a supported installed package as **Runtime detected**.
@@ -61,7 +61,7 @@ ComfyUI/models/LLM/
     └── mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf
 ```
 
-Do not share a projector across incompatible model classes because the filenames happen to match. Writer reads the GGUF metadata to distinguish models from projectors, so a projector does not need `mmproj` in its filename. The filename is only an Extension compatibility hint when metadata cannot be read. Writer enables vision only when it finds one metadata-compatible projector for a model. A missing or ambiguous projector does not hide the model; it leaves the model available in text-only T2VA mode and reports the pairing problem in Direct settings and Scan details.
+Do not share a projector across incompatible model classes because the filenames happen to match. Writer reads the GGUF metadata to distinguish models from projectors, so a projector does not need `mmproj` in its filename. The filename is only an Extension compatibility hint when metadata cannot be read. Writer selects a single compatible projector automatically; no selector is shown in that case. If several match, choose **Vision projector** under the model in Direct settings. The choice is remembered per model and checked again before generation. Only compatible files beside that model are offered. A missing or unresolved projector leaves the model available for text-only use and reports the pairing problem in Direct settings and Scan details.
 
 Select **Refresh** after adding files. Expand **Scan details** if the model does not appear.
 
@@ -135,9 +135,27 @@ If an update replaces `python_embeded` or leaves mixed native packages, reinstal
 
 ```powershell
 .\python_embeded\python.exe -m pip uninstall llama-cpp-python -y
-.\python_embeded\python.exe -m pip install --no-cache-dir --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130 "llama-cpp-python>=0.3.35,<0.4"
+.\python_embeded\python.exe -m pip install --no-cache-dir --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130 "llama-cpp-python==0.3.35"
 ```
 
 Restart ComfyUI and confirm that Direct reports **Runtime detected**, then complete one real Direct generation. Do not copy native DLLs manually, replace ComfyUI's Python files, or install the package into an unrelated system Python.
 
 If ComfyUI exits during the first Direct load or Windows reports `0xC000001D`, see [Illegal instruction](TROUBLESHOOTING.md#windows-0xc000001d-illegal-instruction). Reinstalling the same wheel repeatedly will not solve a CPU instruction incompatibility.
+
+### Additional model folders
+
+ComfyUI extension users can add folders in `extra_model_paths.yaml` using either
+`LLM` or `llm`. Restart ComfyUI after editing the file, then select **Refresh**.
+For example:
+
+```yaml
+writer_models:
+  LLM: |
+    M:/Models/LLM
+    D:/Shared/VideoModels
+```
+
+**Scan details** lists every searched folder. **Copy model path** copies the first
+search folder. Subfolders are scanned too. If several compatible projectors share
+one folder, choose **Vision projector** in Direct settings or move each model and
+its intended projector into its own subfolder. Writer will not guess which file to use.

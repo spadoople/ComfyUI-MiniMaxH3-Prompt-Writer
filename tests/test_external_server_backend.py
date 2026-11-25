@@ -52,6 +52,13 @@ class _FakeLlamaHandler(BaseHTTPRequestHandler):
             return
         type(self).last_completion = payload
         type(self).completion_count += 1
+        if payload.get("model") == "incomplete":
+            body = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if type(self).reasoning_mode == "separate":
             reasoning_chunks = [
                 {"choices": [{"delta": {"reasoning_content": "PRIVATE_"}, "finish_reason": None}]},
@@ -162,6 +169,11 @@ class ExternalServerBackendTests(unittest.TestCase):
         _FakeLlamaHandler.completion_count = 0
         self.backend = ExternalServerBackend()
 
+    def test_partial_stream_without_terminal_is_rejected(self):
+        with self.assertRaises(ModelError) as error:
+            self.backend._request_chat_completion_stream(self.url, {"model": "incomplete"})
+        self.assertEqual(error.exception.code, "EXTERNAL_STREAM_INTERRUPTED")
+
     def test_only_loopback_root_urls_are_accepted(self):
         self.assertEqual(normalize_server_url("http://localhost:8080/v1"), "http://localhost:8080")
         with self.assertRaises(ModelError) as remote:
@@ -173,6 +185,7 @@ class ExternalServerBackendTests(unittest.TestCase):
     def test_probe_returns_external_multimodal_model(self):
         model = self.backend.probe_model({"url": self.url})
         self.assertEqual(model["family"], "external")
+        self.assertFalse(model["lifecycle_supported"])
         self.assertEqual(model["remote_model"], "gemma-test.gguf")
         self.assertEqual(model["server_context_tokens"], 16384)
         self.assertTrue(model["capabilities"]["images"])
@@ -454,7 +467,9 @@ class ExternalServerBackendTests(unittest.TestCase):
         self.assertFalse(issubclass(ExternalServerBackend, GGUFBackend))
         self.assertTrue(self.backend.externally_managed)
         self.assertTrue(model["externally_managed"])
-        self.assertFalse(hasattr(self.backend, "unload"))
+        self.assertFalse(model["lifecycle_supported"])
+        with self.assertRaises(ModelError):
+            self.backend.unload(model["id"])
         self.assertEqual(self.backend.probe_model({"url": self.url})["remote_model"], "gemma-test.gguf")
 
     def test_cancel_interrupts_stream_without_stopping_remote_server(self):

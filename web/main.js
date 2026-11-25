@@ -1,18 +1,32 @@
+import { referenceTextRemapper } from "./reference_labels.js";
+import { draftFile, draftFilename, parseDraft } from "./draft_files.js";
+import { createDesktopNotifications } from "./desktop_notifications.js";
+import { promptHighlightMarkup } from "./prompt_highlights.js";
+import { fitTextarea, generationButtonMarkup, sequenceNotificationOptions, aspectRatioMarkup, bindAspectRatio, splitMenuMarkup, setSplitMenuOpen, copyButtonMarkup } from "./writer_controls.js";
+import { mediaVisualDescriptor } from "./media_visual.js";
+import { createSequenceWorkspace } from "./sequence_workspace.js";
+import { generateSequence, cancelSequence } from "./api/sequence.js";
 import { app } from "/scripts/app.js";
-import { cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, resampleMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
-import { availableReferenceTags, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
+import { selectProjector, cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
+import { comfyVramIsAlreadyEmpty, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
 import { generateModelSummaryMarkup, settingsMarkup } from "./settings.js";
 import {
   buildGeneratePayload,
+  API_SAMPLING_FIELDS,
+  safeApiSampling,
   buildLyricsRefinePayload,
   buildRefinePayload,
   audioWasAdded,
+  clearPromptDraft,
   createStudioState,
   isGenerationModeAvailable,
   isPersistedDraftMode,
   isTextOnlyDirectModel,
   DEFAULT_OLLAMA_HOST,
+  INTERFACE_SIZES,
   loadOllamaModel,
+  loadOllamaHost,
+  loadUserPreferences,
   normalizeOllamaHost,
   saveApiProviderConfig,
   saveCustomSystemPrompts,
@@ -24,15 +38,21 @@ import {
   restoredModelAfterDiscovery,
   selectModelState,
 } from "./studio_state.js";
+import { autoVramControlMarkup, createVramHandoffCoordinator, installVramHandoff, isLocalOllamaHost, releaseComfyVramWhenIdle, unloadWriterModels } from "./vram_handoff.js";
+import { createLazyMediaTool } from "./media_tools.js";
+
+import { editMedia } from "./api/h3studio.js";
 
 const EXTENSION_NAME = "minimax.h3.prompt.studio";
+const LAUNCHER_SCHEMA_VERSION = "2";
+const HIDE_LAUNCHER_SETTING = "H3PromptWriter.General.HideButton";
+const VRAM_HANDOFF_SUPPORTED = typeof app?.queuePrompt === "function";
+const HOST_CAPABILITIES = { windowed: true, comfyMemory: VRAM_HANDOFF_SUPPORTED, workflowMedia: true, ...app.h3psHost };
+const vramHandoffCoordinator = createVramHandoffCoordinator();
 const INSTALLATION_GUIDE_URL = "https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/blob/main/docs/INSTALLATION.md";
 const TROUBLESHOOTING_GUIDE_URL = "https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/blob/main/docs/TROUBLESHOOTING.md";
 const MUSIC3_GUIDE_URL = "https://github.com/MiniMax-AI/MiniMax-Music3/tree/main/skills/music-caption-rewriter";
-const ASPECT_RATIOS = [
-  ["1:1", "Square"], ["2:3", "Portrait"], ["3:2", "Landscape"], ["3:4", "Portrait"],
-  ["4:3", "Landscape"], ["9:16", "Vertical"], ["16:9", "Widescreen"], ["21:9", "Ultrawide"],
-];
+
 const MODES = {
   T2VA: {
     title: "Text to video",
@@ -164,8 +184,12 @@ non_diegetic_music:
 N/A`;
 
 let studio;
+let workflowRevision = 0;
+let mediaPanelRequest = 0;
 let ggufRuntimeDiagnosticsPromise = null;
 let referenceInsertTarget = null;
+let studioReturnFocus = null;
+let studioFocusEpoch = 0;
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>'"]/g, (character) => ({
@@ -301,19 +325,9 @@ function renderPromptHighlights() {
   const editor = studio.root.querySelector("[data-output]");
   const layer = studio.root.querySelector("[data-prompt-highlights]");
   if (!editor || !layer) return;
-  const tokens = /(?<dialogue>&lt;d&gt;[\s\S]*?&lt;\/d&gt;)|(?<media>@(?:Image|Video|Audio)\d+|&lt;(?:Picture|Video|Audio)\s+\d+&gt;)|(?<subject>&lt;Subject\s+\d+&gt;)|(?<section>^(?:(?:subject_definitions|summary|retention_analysis|detailed_description|integrated_multimodal_description|overall_soundscape|non_diegetic_music):|###\s+(?:Global Metadata|Vocal Details|Arrangement)\s*$))|(?<shot>\[(?:Shot\s+\d+|Intro|Verse(?:\s+\d+)?|Pre-Chorus|Chorus(?:\s+\d+)?|Bridge|Instrumental|Final Chorus|Outro)\])|(?<time>\b(?:\d{1,2}:\d{2}(?:\.\d{1,3})?|\d+(?:\.\d+)?\s+seconds?)\b)/gim;
-  layer.innerHTML = escapeHtml(editor.value).replace(tokens, (match, ...args) => {
-    const groups = args.at(-1);
-    if (groups.media) {
-      const parsed = match.match(/@(?<legacy>Image|Video|Audio)(?<legacyNumber>\d+)|&lt;(?<official>Picture|Video|Audio)\s+(?<officialNumber>\d+)&gt;/)?.groups || {};
-      const type = parsed.official || (parsed.legacy === "Image" ? "Picture" : parsed.legacy);
-      const number = parsed.officialNumber || parsed.legacyNumber;
-      const mediaClass = type === "Picture" ? "image" : type.toLowerCase();
-      return `<mark class="is-${mediaClass}" data-prompt-reference="<${type} ${number}>">${match}</mark>`;
-    }
-    const kind = groups.subject ? "subject" : groups.section ? "section" : groups.shot ? "shot" : groups.time ? "time" : "dialogue";
-    return `<mark class="is-${kind}">${match}</mark>`;
-  }) + "\n";
+  // The textarea scrollbar consumes layout width; the mirror has no scrollbar.
+  layer.style.right = `${editor.offsetWidth - editor.clientWidth}px`;
+  layer.innerHTML = promptHighlightMarkup(editor.value) + "\n";
   layer.scrollTop = editor.scrollTop;
   layer.scrollLeft = editor.scrollLeft;
 }
@@ -327,20 +341,35 @@ function syncModifiedState() {
   studio.root.querySelector("[data-undo-edits]").hidden = !modified || !hasBaseline;
 }
 
+const STYLE_MODULES = [
+  "tokens",
+  "themes/dark",
+  "themes/light",
+  "foundation",
+  "shell",
+  "workbench",
+  "media",
+  "composer",
+  "editor",
+  "floating-media",
+  "settings",
+  "models",
+  "providers",
+  "prompts",
+  "overlays",
+  "music",
+  "responsive",
+  "sequence",
+];
+
 function injectStyles() {
-  if (!document.querySelector("link[data-h3ps-styles]")) {
+  for (const name of STYLE_MODULES) {
+    if (document.querySelector(`link[data-h3ps-style="${name}"]`)) continue;
     const link = document.createElement("link");
     link.rel = "stylesheet";
-    link.href = new URL("./styles.css", import.meta.url).href;
-    link.dataset.h3psStyles = "true";
+    link.href = new URL(`./styles/${name}.css`, import.meta.url).href;
+    link.dataset.h3psStyle = name;
     document.head.appendChild(link);
-  }
-  if (!document.querySelector("link[data-h3ps-skin]")) {
-    const skin = document.createElement("link");
-    skin.rel = "stylesheet";
-    skin.href = new URL("./skin.css", import.meta.url).href;
-    skin.dataset.h3psSkin = "true";
-    document.head.appendChild(skin);
   }
 }
 
@@ -355,18 +384,25 @@ function icon(name, size = 16) {
     chevron: '<path d="m9 18 6-6-6-6"/>',
     copy: '<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
     play: '<path d="m9 7 8 5-8 5V7Z" fill="currentColor" stroke="none"/>',
+    pause: '<path d="M8 6v12M16 6v12" stroke-width="3"/>',
     check: '<path d="m5 12 4 4L19 6"/>',
     info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/>',
     refresh: '<path d="M20 11a8 8 0 1 0-2.35 5.65L20 14"/><path d="M20 7v4h-4"/>',
     memory: '<rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9zM9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3"/>',
     expand: '<path d="M8 3H3v5m13-5h5v5M8 21H3v-5m13 5h5v-5"/>',
     collapse: '<path d="M8 8H3V3m13 5h5V3M8 16H3v5m13-5h5v5"/>',
+    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/>',
+    moon: '<path d="M20.2 15.3A8.5 8.5 0 0 1 8.7 3.8 8.5 8.5 0 1 0 20.2 15.3Z"/>',
+    grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+    download: '<path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 19h14"/>',
+    crop: '<path d="M6 2v14a2 2 0 0 0 2 2h14M18 22V8a2 2 0 0 0-2-2H2"/>',
   };
-  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true">${paths[name] || paths.info}</svg>`;
+  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" style="--h3ps-icon-size:${size}px" aria-hidden="true">${paths[name] || paths.info}</svg>`;
 }
 
 function renderAsset(asset, index) {
   const destructiveDisabled = studio.requestBusy ? "disabled" : "";
+  const tagDisabled = studio.requestBusy ? "disabled" : "";
   const draggable = studio.requestBusy ? "false" : "true";
   const visual = asset.type === "audio"
     ? `<div class="h3ps-wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>`
@@ -376,21 +412,87 @@ function renderAsset(asset, index) {
   const overlay = asset.type === "video" ? `<span class="h3ps-play">${icon("play", 18)}</span>` : "";
   const duration = formatDuration(asset.duration);
   return `
-    <div class="h3ps-asset" draggable="${draggable}" data-asset-index="${index}" data-asset-id="${asset.id}" data-replace-label="Replace ${escapeHtml(asset.reference)}">
+    <div class="h3ps-asset" tabindex="0" role="group" aria-label="Media inspector" draggable="${draggable}" data-asset-index="${index}" data-asset-id="${asset.id}" data-replace-label="Replace ${escapeHtml(asset.reference || asset.filename)}">
       <span class="h3ps-asset-preview h3ps-${asset.type}">${visual}${overlay}</span>
       <span class="h3ps-asset-copy">
-        <strong>${escapeHtml(asset.reference)}</strong>
+        <strong>${asset.reference ? `<button type="button" class="h3ps-media-tag is-${asset.type}" data-media-tag="${escapeHtml(asset.reference)}" ${tagDisabled} title="Insert reference at text cursor">${escapeHtml(asset.reference || asset.filename)}</button>` : "Trim required"}</strong>
         <small>${escapeHtml(asset.filename)}</small>
       </span>
       ${duration ? `<span class="h3ps-duration">${duration}</span>` : ""}
-      <button class="h3ps-replace-asset" type="button" data-replace-asset="${asset.id}" title="Replace ${escapeHtml(asset.reference)}" aria-label="Replace ${escapeHtml(asset.reference)}" ${destructiveDisabled}>${icon("refresh", 12)}</button>
-      <button class="h3ps-remove-asset" type="button" data-remove-asset="${asset.id}" title="Remove ${escapeHtml(asset.reference)}" aria-label="Remove ${escapeHtml(asset.reference)}" ${destructiveDisabled}>${icon("close", 12)}</button>
+      <button class="h3ps-replace-asset" type="button" data-replace-asset="${asset.id}" title="Replace ${escapeHtml(asset.reference || asset.filename)}" aria-label="Replace ${escapeHtml(asset.reference || asset.filename)}" ${destructiveDisabled}>${icon("refresh", 12)}</button>
+      <button class="h3ps-remove-asset" type="button" data-remove-asset="${asset.id}" title="Remove ${escapeHtml(asset.reference || asset.filename)}" aria-label="Remove ${escapeHtml(asset.reference || asset.filename)}" ${destructiveDisabled}>${icon("close", 12)}</button>
     </div>`;
 }
 
+function referenceComposerAssets() {
+  return studio.assets.filter((asset) => asset.mode === "Reference" && mediaVisualDescriptor(asset));
+}
+
+function composerAddState() {
+  const assets = studio.assets.filter((asset) => asset.mode === "Reference");
+  const pictureCount = assets.filter((asset) => asset.type === "image").length;
+  if (studio.requestBusy) return { allowed: false, message: "Wait for the current Writer request to finish." };
+  if (pictureCount >= 9) return { allowed: false, message: "Remove a Picture before adding the composition." };
+  if (assets.length >= 12) return { allowed: false, message: "Remove a reference before adding the composition." };
+  return { allowed: true, reference: `<Picture ${pictureCount + 1}>` };
+}
+
+function syncComposerControl(mode = studio.mode) {
+  const panel = studio.root.querySelector("[data-media-panel-action]");
+  if (panel) {
+    panel.disabled = !studio.assets.some(asset => ["image", "video", "audio"].includes(asset.type) && asset.content_url);
+    panel.title = panel.disabled ? "Add media first" : "Open Media panel";
+  }
+  const button = studio.root.querySelector("[data-open-composer]");
+  if (!button) return;
+  const sources = mode === "Reference" ? referenceComposerAssets() : [];
+  button.disabled = studio.requestBusy || !sources.length;
+  button.title = mode !== "Reference" ? "Switch to Reference mode"
+    : studio.requestBusy ? "Wait for the current request to finish"
+    : sources.length ? `Compose a new Picture from ${sources.length} media source${sources.length === 1 ? "" : "s"}`
+    : "Add a Picture or Video first";
+}
+
+async function addComposedPicture({ blob, width, height, mimeType, filename, sources }) {
+  const file = new File([blob], filename, { type: mimeType });
+  const result = await uploadMedia(studio.sessionId, "Reference", [file]);
+  studio.sessionId = result.session_id;
+  studio.assets = [...studio.assets, ...result.assets];
+  studio.mediaFilter = studio.mediaFilter === "image" ? "image" : "all";
+  renderMedia("Reference");
+  const added = result.assets[0];
+  showToast(
+    `${added.reference} added`,
+    `Composed from ${sources.length} source${sources.length === 1 ? "" : "s"} · ${width}×${height} PNG.`,
+  );
+}
+
+function openMediaComposer(trigger) {
+  if (studio.mode !== "Reference" || studio.requestBusy) return;
+  const assets = referenceComposerAssets();
+  if (!assets.length) return;
+  setClearMenuOpen(false);
+  studio.mediaComposer.open({ assets, trigger: studio.root.querySelector("[data-actions-menu-toggle]") });
+}
+
+function notifyMediaCompatibility() {
+  const pending=studio.assets.filter(a=>a.status==="needs_edit");
+  const total=studio.assets.filter(a=>a.mode==="Reference"&&a.type==="video"&&a.status!=="needs_edit").reduce((sum,a)=>sum+(a.duration||0),0);
+  const signature=pending.map(a=>a.id).join("|")+":"+(total>15);
+  if(signature===studio.mediaCompatibilityNotice)return;
+  studio.mediaCompatibilityNotice=signature;
+  const messages=[];
+  if(pending.length)messages.push("Trim the video source to 2–15 seconds and Apply to use it as a reference.");
+  if(total>15)messages.push("Reference videos exceed 15 seconds in total. Prompt generation is still available; check H3 compatibility.");
+  if(messages.length)showToast("Reference media",messages.join(" "),null,null,{dismissOnWorkspaceClick:true});
+}
+
 function renderMedia(mode) {
+  mode = studio.sequence?.mediaMode(mode) ?? mode;
+  studio.floatingMedia?.refresh();
   if (mode === "Music3") {
     studio.root.querySelectorAll("[data-mode]").forEach((button) => button.classList.remove("is-active"));
+    syncComposerControl(mode);
     syncModeAvailability();
     return;
   }
@@ -432,9 +534,12 @@ function renderMedia(mode) {
         ${canAdd ? `<button class="${assets.length ? "h3ps-add-asset" : "h3ps-empty-drop"}" type="button" data-add-media ${studio.requestBusy ? "disabled" : ""}>${icon("plus", 18)}<span>${addLabel}</span><small>Drop files here</small></button>` : ""}
       </div>`;
   }
+  notifyMediaCompatibility();
   bindMediaActions(mode);
-  syncReferenceInsertControl();
+  syncComposerControl(mode);
+
   syncModeAvailability();
+  studio.sequence?.refresh();
 }
 
 function setMusicSystemPromptProfile(profile) {
@@ -467,67 +572,51 @@ function setMusicSystemPromptExpanded(open) {
   if (!open) setMusicSystemPromptEditorOpen(false);
 }
 
-function referenceTagKind(reference) {
-  const type = reference.match(/^<(Subject|Picture|Video|Audio) /)?.[1] || "Subject";
-  return type === "Picture" ? "image" : type.toLowerCase();
-}
-
-function referenceTagsForCurrentDraft() {
-  if (!studio || studio.mode !== "Reference") return [];
-  return availableReferenceTags(studio.assets, studio.root.querySelector("[data-output]").value);
-}
-
-function closeReferenceInsert() {
-  if (!studio) return;
-  const popover = studio.root.querySelector("[data-reference-insert-popover]");
-  const toggle = studio.root.querySelector("[data-reference-insert-toggle]");
-  if (popover) popover.hidden = true;
-  if (toggle) toggle.setAttribute("aria-expanded", "false");
-}
-
-function syncReferenceInsertControl() {
-  if (!studio) return;
-  const control = studio.root.querySelector("[data-reference-insert]");
-  const toggle = studio.root.querySelector("[data-reference-insert-toggle]");
-  if (!control || !toggle) return;
-  const referenceMode = studio.mode === "Reference";
-  const tags = referenceMode ? referenceTagsForCurrentDraft() : [];
-  control.hidden = !referenceMode;
-  toggle.disabled = !tags.length || studio.requestBusy;
-  toggle.title = tags.length ? "Insert reference" : "Add reference media first";
-  if (!referenceMode || !tags.length) closeReferenceInsert();
-}
-
 function rememberReferenceInsertTarget(editor) {
-  if (studio?.mode !== "Reference" || !editor) return;
+  if (!studio || studio.mode === "Music3" || !editor) return;
   referenceInsertTarget = { editor, caret: editor.selectionStart ?? editor.value.length };
 }
 
-function toggleReferenceInsert() {
-  const popover = studio.root.querySelector("[data-reference-insert-popover]");
-  const toggle = studio.root.querySelector("[data-reference-insert-toggle]");
-  const opening = popover.hidden;
-  if (!opening) {
-    closeReferenceInsert();
-    return;
-  }
-  const tags = referenceTagsForCurrentDraft();
-  if (!tags.length) return;
-  popover.innerHTML = tags.map((reference) => `<button type="button" class="h3ps-reference-chip is-${referenceTagKind(reference)}" data-insert-reference="${escapeHtml(reference)}" role="menuitem">${escapeHtml(reference)}</button>`).join("");
-  popover.hidden = false;
-  toggle.setAttribute("aria-expanded", "true");
-}
-
-function insertSelectedReference(reference) {
-  if (studio.mode !== "Reference") return;
+function insertSelectedReference(reference, assetId) {
+  if (studio.sequence?.insert(assetId)) return;
+  if (studio.mode === "Music3") return;
   const fallback = studio.root.querySelector("[data-output]");
   const target = referenceInsertTarget?.editor?.isConnected ? referenceInsertTarget : { editor: fallback, caret: fallback.selectionStart };
   target.editor.setSelectionRange(target.caret, target.caret);
   if (insertReferenceAtCaret(target.editor, reference, target.caret)) {
     rememberReferenceInsertTarget(target.editor);
-    syncReferenceInsertControl();
   }
-  closeReferenceInsert();
+}
+
+function acceptMediaAssets(assets) {
+  const rewrite = referenceTextRemapper(studio.assets, assets);
+  let missing = false;
+  const remap = text => {
+    const next = rewrite(text);
+    if (next !== text && /<Missing (Picture|Video|Audio) [1-9]\d*>/.test(next)) missing = true;
+    return next;
+  };
+  const saved = studio.modeDrafts.Reference;
+  if (saved) studio.modeDrafts.Reference = {...saved, brief:remap(saved.brief), prompt:remap(saved.prompt)};
+  // Sequence owns request-local labels. Only the separate Single draft is rewritten.
+  if (studio.mode === "Reference") {
+    for (const selector of ["[data-video-brief]", "[data-output]", "[data-refine-instruction]"]) {
+      const input = studio.root.querySelector(selector), next = remap(input.value);
+      if (next !== input.value) input.value = next;
+    }
+    studio.lastModelPrompt = remap(studio.lastModelPrompt);
+    if (studio.lastModelPrompt != null) studio.lastModelMeta = promptLengthMeta(studio.lastModelPrompt);
+    if (studio.refineRestore) {
+      studio.refineRestore.prompt = remap(studio.refineRestore.prompt);
+      studio.refineRestore.lastModelPrompt = remap(studio.refineRestore.lastModelPrompt);
+      studio.refineRestore.meta = promptLengthMeta(studio.refineRestore.prompt);
+      if (studio.refineRestore.lastModelPrompt != null) studio.refineRestore.lastModelMeta = promptLengthMeta(studio.refineRestore.lastModelPrompt);
+    }
+    studio.root.querySelector(".h3ps-editor-meta span:last-child").textContent = promptLengthMeta(studio.root.querySelector("[data-output]").value);
+    updateBriefLayout(); renderPromptHighlights(); syncModifiedState(); saveCurrentModeDraft();
+  } else saveModeDrafts(localStorage, studio.modeDrafts);
+  studio.assets = assets;
+  if (missing) showToast("Reference removed", "Missing media tags are marked in your Single text. Replace or remove them before Generate or Refine.");
 }
 
 function bindMediaActions(mode) {
@@ -539,10 +628,14 @@ function bindMediaActions(mode) {
     });
   });
   studio.root.querySelectorAll("[data-asset-index]").forEach((button) => {
+    button.addEventListener("keydown",event=>{
+      if(event.target===button && ["Enter"," "].includes(event.key)){event.preventDefault();button.click();}
+    });
     button.addEventListener("click", (event) => {
       if (event.target.closest("button")) return;
       const asset = studio.assets.find((item) => item.id === button.dataset.assetId);
-      previewAsset(asset);
+      if(asset.type === "image" || asset.type === "video"){if(!studio.requestBusy)studio.mediaEditor.open(asset,button);}
+      else previewAsset(asset);
     });
   });
   studio.root.querySelectorAll("[data-replace-asset]").forEach((button) => {
@@ -552,13 +645,17 @@ function bindMediaActions(mode) {
       chooseMedia(mode, button.dataset.replaceAsset);
     });
   });
+  studio.root.querySelectorAll("[data-media-tag]").forEach(button=>{
+    button.addEventListener("pointerdown",e=>e.preventDefault());
+    button.addEventListener("click",e=>{e.stopPropagation();if(!studio.requestBusy)insertSelectedReference(button.dataset.mediaTag,button.closest("[data-asset-id]")?.dataset.assetId);});
+  });
   studio.root.querySelectorAll("[data-remove-asset]").forEach((button) => {
     button.addEventListener("click", async (event) => {
       event.stopPropagation();
       try {
         const result = await removeMedia(studio.sessionId, button.dataset.removeAsset);
-        studio.assets = result.assets;
-        renderMedia(mode);
+        acceptMediaAssets(result.assets);
+        renderMedia(studio.mode);
       } catch (error) {
         showToast(error.code || "Remove failed", error.message, error.details);
       }
@@ -577,13 +674,12 @@ function bindMediaActions(mode) {
       media.classList.add("is-reordering");
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("application/x-h3ps-asset", card.dataset.assetId);
-      const asset = studio.assets.find((item) => item.id === card.dataset.assetId);
-      const ghost = document.createElement("div");
-      ghost.className = "h3ps-drag-ghost";
-      ghost.innerHTML = `${asset?.preview_url ? `<img src="${asset.preview_url}" alt="">` : ""}<span><strong>${escapeHtml(asset?.reference || "Media")}</strong><small>Move reference</small></span>`;
-      document.body.appendChild(ghost);
+      const ghost = document.createElement("canvas");
+      ghost.width = ghost.height = 1;
+      ghost.style.cssText = "position:fixed;left:-10px;top:-10px;width:1px;height:1px;pointer-events:none";
+      studio.root.appendChild(ghost);
       studio.dragGhost = ghost;
-      event.dataTransfer.setDragImage(ghost, 24, 20);
+      event.dataTransfer.setDragImage(ghost, 0, 0);
       requestAnimationFrame(() => card.classList.add("is-dragging"));
     });
     card.addEventListener("dragend", () => {
@@ -631,8 +727,8 @@ function bindMediaActions(mode) {
       const reorderedAssets = moveOntoTarget(modeAssets, sourceId, targetId);
       try {
         const result = await reorderMedia(studio.sessionId, mode, reorderedAssets.map((asset) => asset.id));
-        studio.assets = result.assets;
-        renderMedia(mode);
+        acceptMediaAssets(result.assets);
+        renderMedia(studio.mode);
       } catch (error) {
         showToast(error.code || "Reorder failed", error.message, error.details);
       }
@@ -645,9 +741,7 @@ function bindMediaActions(mode) {
 
 function previewAsset(asset) {
   if (!asset) return;
-  if (asset.type === "video") openVideoPreview(asset);
-  else if (asset.type === "image") openImagePreview(asset);
-  else showToast(asset.reference, `${formatDuration(asset.duration)} audio reference loaded.`);
+  showToast(asset.reference, `${formatDuration(asset.duration)} audio reference loaded.`);
 }
 
 function chooseMedia(mode, replaceAssetId = null) {
@@ -671,9 +765,9 @@ async function uploadFiles(mode, files, replaceAssetId = null) {
   try {
     const result = await uploadMedia(studio.sessionId, mode, files, replaceAssetId);
     studio.sessionId = result.session_id;
-    studio.assets = replaceAssetId ? result.assets : [...studio.assets, ...result.assets];
-    renderMedia(mode);
     hideToast();
+    if (replaceAssetId) acceptMediaAssets(result.assets);
+    else studio.assets = [...studio.assets, ...result.assets];
     if (audioWasAdded(previousAssets, studio.assets)) {
       showToast(
         "Audio added",
@@ -683,102 +777,10 @@ async function uploadFiles(mode, files, replaceAssetId = null) {
         { durationMs: 6000 },
       );
     }
-  } catch (error) {
-    renderMedia(mode);
-    showToast(error.code || "Upload failed", error.message, error.details);
-  }
-}
-
-function openVideoPreview(asset) {
-  const preview = studio.root.querySelector("[data-h3ps-preview]");
-  studio.previewAssetId = asset.id;
-  preview.querySelector("[data-preview-name]").textContent = asset.filename;
-  const video = preview.querySelector("[data-preview-video]");
-  video.src = asset.content_url;
-  preview.querySelector("[data-preview-sheet]").src = asset.contact_sheet_url || "";
-  preview.querySelectorAll("[data-frame-count]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.frameCount === (asset.frame_count_mode || "auto"));
-  });
-  preview.querySelector("[data-include-endpoints]").checked = asset.include_endpoints !== false;
-  preview.querySelector("[data-preview-sampling]").textContent = `One sheet · ${asset.frames.length} frames · read left to right`;
-  preview.classList.add("is-open");
-  preview.classList.remove("is-updating");
-  preview.setAttribute("aria-hidden", "false");
-}
-
-function closeVideoPreview() {
-  const preview = studio.root.querySelector("[data-h3ps-preview]");
-  preview.classList.remove("is-open");
-  preview.setAttribute("aria-hidden", "true");
-  preview.querySelector("[data-preview-video]").pause();
-}
-
-function openImagePreview(asset) {
-  const preview = studio.root.querySelector("[data-h3ps-image-preview]");
-  preview.querySelector("[data-image-preview-reference]").textContent = asset.reference || "Picture reference";
-  preview.querySelector("[data-image-preview-name]").textContent = asset.filename;
-  const image = preview.querySelector("[data-image-preview-image]");
-  const dialog = preview.querySelector(".h3ps-image-preview-dialog");
-  image.onload = () => {
-    const aspect = image.naturalWidth / image.naturalHeight || 1;
-    const maxStageWidth = Math.max(260, Math.min(1200, window.innerWidth - 88));
-    const maxStageHeight = Math.max(260, Math.min(900, window.innerHeight - 146));
-    let stageWidth = maxStageWidth;
-    let stageHeight = stageWidth / aspect;
-    if (stageHeight > maxStageHeight) {
-      stageHeight = maxStageHeight;
-      stageWidth = stageHeight * aspect;
-    }
-    dialog.style.setProperty("--h3ps-image-preview-width", `${Math.round(stageWidth + 28)}px`);
-    dialog.style.setProperty("--h3ps-image-preview-height", `${Math.round(stageHeight + 86)}px`);
-  };
-  image.alt = asset.filename;
-  image.src = asset.content_url || asset.preview_url;
-  preview.classList.add("is-open");
-  preview.setAttribute("aria-hidden", "false");
-}
-
-function closeImagePreview() {
-  const preview = studio.root.querySelector("[data-h3ps-image-preview]");
-  preview.classList.remove("is-open");
-  preview.setAttribute("aria-hidden", "true");
-  const image = preview.querySelector("[data-image-preview-image]");
-  image.onload = null;
-  image.removeAttribute("src");
-}
-
-function setSheetUpdating(updating) {
-  const preview = studio.root.querySelector("[data-h3ps-preview]");
-  preview.classList.toggle("is-updating", updating);
-  preview.querySelectorAll("[data-frame-count], [data-include-endpoints], [data-resample]").forEach((control) => {
-    control.disabled = updating || studio.requestBusy;
-  });
-}
-
-async function resampleCurrentVideo(options = null) {
-  const asset = studio.assets.find((item) => item.id === studio.previewAssetId);
-  if (!asset) return;
-  const preview = studio.root.querySelector("[data-h3ps-preview]");
-  const selectedCount = options?.frame_count || preview.querySelector("[data-frame-count].is-active")?.dataset.frameCount || asset.frame_count_mode || "auto";
-  const includeEndpoints = options?.include_endpoints ?? preview.querySelector("[data-include-endpoints]").checked;
-  preview.querySelectorAll("[data-frame-count]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.frameCount === selectedCount);
-  });
-  setSheetUpdating(true);
-  try {
-    const result = await resampleMedia(studio.sessionId, asset.id, {
-      frame_count: selectedCount,
-      include_endpoints: includeEndpoints,
-    });
-    Object.assign(asset, result.asset);
-    openVideoPreview(asset);
     renderMedia(studio.mode);
-    showToast("Contact sheet updated", `The model will use ${asset.frames.length} uniformly sampled frames.`);
   } catch (error) {
-    openVideoPreview(asset);
-    showToast(error.code || "Resample failed", error.message, error.details);
-  } finally {
-    setSheetUpdating(false);
+    renderMedia(studio.mode);
+    showToast(error.code || "Upload failed", error.message, error.details);
   }
 }
 
@@ -841,6 +843,79 @@ function currentBriefTextarea() {
   return studio.root.querySelector(studio.mode === "Music3" ? "[data-music-brief]" : "[data-video-brief]");
 }
 
+async function copyPromptText(text, music = false) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast(music ? "Caption copied" : "Prompt copied", music ? "The generated Music 3 caption is on your clipboard." : "The generated H3 prompt is on your clipboard.");
+  } catch (error) {
+    showToast("Copy failed", "Clipboard access was denied.", error.message);
+  }
+}
+
+function setClearMenuOpen(open) {
+  if (!studio) return;
+  setSplitMenuOpen(studio.root.querySelector("[data-clear-control]"), open);
+}
+
+function clearCurrentPrompts({ notify = true } = {}) {
+  if (!studio || studio.requestBusy) return false;
+  const draft = clearPromptDraft(currentDraftFields());
+  const output = studio.root.querySelector("[data-output]");
+  currentBriefTextarea().value = draft.brief;
+  output.value = draft.prompt;
+  studio.lastModelPrompt = null;
+  studio.lastModelMeta = null;
+  studio.refineRestore = null;
+  studio.root.querySelector("[data-refine-restore]").hidden = true;
+  toggleRefine(false);
+
+  studio.root.querySelector(".h3ps-editor-meta span:last-child").textContent = promptLengthMeta(output.value);
+  updateBriefLayout();
+  renderPromptHighlights();
+  syncModifiedState();
+
+  saveCurrentModeDraft();
+  if (notify) {
+    const detail = studio.mode === "Music3"
+      ? "The Music Brief and generated caption were cleared. Lyrics and media were kept."
+      : "The Creative Brief and generated prompt were cleared. Media was kept.";
+    showToast("Prompts cleared", detail);
+  }
+  return true;
+}
+
+async function clearCurrentMedia({ notify = true } = {}) {
+  if (!studio || studio.requestBusy) return false;
+  try {
+    const result = await clearMedia(studio.sessionId, studio.sequence?.mediaMode(studio.mode) ?? studio.mode);
+    studio.assets = result.assets;
+
+
+    renderMedia(studio.mode);
+    if (notify) showToast("Media cleared", "The temporary session files were removed.");
+    return true;
+  } catch (error) {
+    showToast(error.code || "Clear failed", error.message, error.details);
+    return false;
+  }
+}
+
+async function clearEverything() {
+  const mode = studio.mode;
+  const submittedDraft = currentDraftFields();
+  if (!await clearCurrentMedia({ notify: false })) return;
+  const currentDraft = currentDraftFields();
+  if (studio.mode !== mode || currentDraft.brief !== submittedDraft.brief || currentDraft.prompt !== submittedDraft.prompt) {
+    showToast("Media cleared", "Your current prompts were kept because the workspace changed.");
+    return;
+  }
+  clearCurrentPrompts({ notify: false });
+  const detail = studio.mode === "Music3"
+    ? "Media, Music Brief and generated caption were removed. Lyrics were kept."
+    : "Media, Creative Brief and generated prompt were removed.";
+  showToast("Everything cleared", detail);
+}
+
 function saveCurrentModeDraft() {
   if (!studio || !isPersistedDraftMode(studio.mode)) return;
   studio.modeDrafts[studio.mode] = currentDraftFields();
@@ -852,19 +927,85 @@ function stashCurrentModeDraft() {
   saveCurrentModeDraft();
 }
 
+function saveTextDraft() {
+  if (studio.requestBusy) return;
+  try {
+    const sequence = studio.sequence.active;
+    const mode = sequence ? "Reference" : studio.mode;
+    const media = studio.assets.filter(a => a.mode === mode).map(a => `${a.reference || a.type}: ${a.filename}`);
+    if (sequence) {
+      const state = studio.sequence.state, name = id => studio.assets.find(a => a.id === id)?.filename || "Missing media";
+      if (state.first) media.push(`First frame: ${name(state.first)}`);
+      if (state.last) media.push(`Last frame: ${name(state.last)}`);
+      state.references.forEach(id => media.push(`Sequence reference: ${name(id)}`));
+      state.chunks.forEach((c,i) => {
+        c.additions.forEach(id => media.push(`Chunk ${i+1} reference: ${name(id)}`));
+        c.exclusions.forEach(id => media.push(`Chunk ${i+1} excludes: ${name(id)}`));
+      });
+    }
+    const profile = mode === "Reference" ? "reference" : "standard";
+    const value = draftFile(sequence ? "sequence" : "single", sequence ? studio.sequence.state : {
+      mode, ...currentDraftFields(), duration:studio.durationSeconds, aspectRatio:studio.aspectRatio,
+      instructions:studio.customSystemPrompts[profile] ?? null,
+    }, media);
+    const blob = new Blob([JSON.stringify(value,null,2)], {type:"application/json"});
+    const url = URL.createObjectURL(blob), link = document.createElement("a");
+    link.href=url; link.download=draftFilename(value.kind); link.click();
+    setTimeout(()=>URL.revokeObjectURL(url), 1000);
+  } catch(error) { showToast("Save draft", error.message); }
+}
+
+async function loadTextDraft(value) {
+  if (studio.requestBusy) return;
+  const owner = studio;
+  let loaded = false;
+  const mode = value.kind === "sequence" ? "Reference" : value.content.mode;
+  setGenerationState("busy", "Loading draft", "");
+  try {
+    // Remove this mode's old references so identical labels cannot bind to unrelated media.
+    const result = await clearMedia(studio.sessionId, mode);
+    if (studio !== owner) return;
+    studio.assets = result.assets;
+    stashCurrentModeDraft();
+    if (value.kind === "sequence") {
+      studio.mode = "Reference"; studio.lastVideoMode = "Reference"; syncWorkspace();
+      studio.sequence.loadDraft(value.content);
+    } else {
+      studio.sequence.setActive(false);
+      studio.mode=mode; studio.lastVideoMode=mode;
+      studio.durationSeconds=value.content.duration; studio.aspectRatio=value.content.aspectRatio; studio.aspectControl.update(studio.aspectRatio);
+      studio.modeDrafts[mode]={brief:value.content.brief,prompt:value.content.prompt};
+      const profile=mode === "Reference" ? "reference" : "standard";
+      if(value.content.instructions === null) delete studio.customSystemPrompts[profile];
+      else studio.customSystemPrompts[profile]=value.content.instructions;
+      saveCustomSystemPrompts(localStorage,studio.customSystemPrompts);
+      saveModeDrafts(localStorage,studio.modeDrafts); saveUserPreferences(localStorage,studio);
+      studio.root.querySelector("[data-duration-slider]").value=String(studio.durationSeconds);
+      studio.root.querySelector("[data-duration-slider]").dispatchEvent(new Event("input"));
+      syncWorkspace(); restoreModeDraft(mode); syncSystemPromptEditors();
+    }
+    renderMedia(studio.mode);
+    loaded = true;
+    showToast("Draft loaded", "Media is not included. Reattach and assign the original references before generating.", value.media.length ? {references:value.media} : null);
+  } catch(error) { showToast("Load draft",error.message); }
+  finally {
+    if (studio === owner) {
+      setGenerationState("idle", "", "");
+      if (loaded && value.kind === "sequence") studio.sequence.setActive(true);
+    }
+  }
+}
+
 function updateBriefLayout() {
   if (!studio) return;
   const brief = currentBriefTextarea();
-  const fullscreen = studio.fullscreen && studio.root.classList.contains("is-open");
   const compactHeight = window.innerHeight <= 800;
   const largeCanvas = window.innerWidth >= 3000 && window.innerHeight >= 1600;
   const minimumHeight = compactHeight ? 80 : largeCanvas ? 125 : 105;
-  const maximumHeight = compactHeight ? 130 : largeCanvas ? 230 : 190;
-  const briefLimit = studio.mode === "Music3" ? 2000 : 8000;
-  brief.closest(".h3ps-brief").querySelector(".h3ps-char-count").textContent = `${brief.value.length.toLocaleString()} / ${briefLimit.toLocaleString()}`;
-  brief.style.height = "auto";
-  brief.style.height = `${fullscreen ? Math.max(minimumHeight, brief.scrollHeight) : Math.min(maximumHeight, Math.max(minimumHeight, brief.scrollHeight))}px`;
-  brief.style.overflowY = !fullscreen && brief.scrollHeight > maximumHeight ? "auto" : "hidden";
+  const counter = brief.closest(".h3ps-brief").querySelector(".h3ps-char-count");
+  counter.textContent = `${brief.value.length.toLocaleString()}${studio.mode === "Music3" ? " / 2,000" : " characters"}`;
+  fitTextarea(brief, minimumHeight, 2);
+  brief.style.overflowY = "hidden";
 }
 
 function updateMusicLyricsCount() {
@@ -905,7 +1046,10 @@ function syncWorkspace() {
   studio.root.querySelector("[data-video-modes]").hidden = music;
   studio.root.querySelector("[data-video-inputs]").hidden = music;
   studio.root.querySelector("[data-music-inputs]").hidden = !music;
-  studio.root.querySelector("[data-output-label]").textContent = music ? "Generated caption" : "Generated prompt";
+  const outputLabel = music ? "Generated caption" : "Generated prompt";
+  studio.root.querySelector("[data-output-label]").textContent = outputLabel;
+  studio.root.querySelector("[data-output-mobile-label]").textContent = outputLabel;
+  studio.root.querySelector("[data-output]").setAttribute("aria-label", outputLabel);
   studio.root.querySelector("[data-copy-label]").textContent = music ? "Copy caption" : "Copy prompt";
   studio.root.querySelector("[data-generate-label]").textContent = music ? "Generate caption" : "Generate prompt";
   studio.root.querySelector("[data-refine-media-note]").textContent = music ? "Lyrics stay separate" : "No media re-upload";
@@ -914,9 +1058,9 @@ function syncWorkspace() {
   studio.root.querySelector("[data-refine-instruction]").placeholder = music
     ? "For example: keep the verses sparse and let the final chorus open wider."
     : "For example: make the camera movement slower and keep the ending more ambiguous.";
-  if (studio.mode === "Reference") rememberReferenceInsertTarget(studio.root.querySelector("[data-output]"));
+  if (studio.mode !== "Music3") rememberReferenceInsertTarget(studio.root.querySelector("[data-output]"));
   else referenceInsertTarget = null;
-  syncReferenceInsertControl();
+
   if (music) {
     syncSystemPromptEditor("music3");
     syncSystemPromptEditor("music3_lyrics");
@@ -939,12 +1083,9 @@ function syncModeAvailability() {
       : "";
   });
   studio.root.querySelectorAll("[data-workspace]").forEach((control) => {
-    const unavailable = textOnlyDirect && control.dataset.workspace === "music";
-    control.disabled = studio.requestBusy || unavailable;
+    control.disabled = studio.requestBusy;
     control.setAttribute("aria-disabled", String(control.disabled));
-    control.title = unavailable
-      ? "This Direct GGUF is text-only. Only H3 Video · T2VA is available."
-      : "";
+    control.title = "";
   });
 }
 
@@ -952,7 +1093,7 @@ function generationModeIsAvailable() {
   if (isGenerationModeAvailable(studio.selectedModel, studio.mode)) return true;
   showToast(
     "Text-only Direct GGUF",
-    "Use H3 Video · T2VA, or add the matching mmproj to enable visual modes.",
+    "Use T2VA or Music3, or add the matching mmproj to enable visual modes.",
   );
   return false;
 }
@@ -1009,19 +1150,20 @@ function setGenerationState(state, label, detail) {
   const status = studio.root.querySelector("[data-status]");
   const statusDetail = studio.root.querySelector("[data-status-detail]");
   const busy = state === "busy";
+  const wasBusy = studio.requestBusy;
   studio.requestBusy = busy;
-  studio.root.querySelector("[data-clear-media]").disabled = busy;
   syncModeAvailability();
+  studio.root.querySelectorAll("[data-draft-save], [data-draft-load], [data-clear-media], [data-clear-menu-toggle], [data-actions-menu-toggle], [data-clear-action]").forEach((control) => { control.disabled = busy; });
+  if (busy) setClearMenuOpen(false);
   studio.root.querySelector("[data-lyrics-refine-toggle]").disabled = busy;
   const comfyMemory = studio.root.querySelector("[data-comfy-memory-action]");
-  comfyMemory.disabled = busy;
+  comfyMemory.disabled = busy || !HOST_CAPABILITIES.comfyMemory;
   comfyMemory.title = busy
     ? "Available after the active Writer request finishes"
     : "Unload models held by ComfyUI without clearing cached workflow results";
   button.classList.toggle("is-cancel", busy);
-  button.innerHTML = busy ? `<span class="h3ps-spinner"></span>Cancel` : `${icon("spark", 16)}<span data-generate-label>${studio.mode === "Music3" ? "Generate caption" : "Generate prompt"}</span>`;
+  if (!busy || !wasBusy) button.innerHTML = generationButtonMarkup(icon, busy, studio.mode === "Music3" ? "Generate caption" : "Generate prompt");
   renderMedia(studio.mode);
-  setSheetUpdating(false);
   syncLifecycleActions();
   status.hidden = !busy;
   status.classList.toggle("is-busy", busy);
@@ -1044,24 +1186,145 @@ function updatePromptResidency(status) {
   if (!residency) return;
   studio.promptResidency = {
     direct: residency.direct?.loaded ? { modelId: residency.direct.model_id || null } : null,
+    external: Array.isArray(residency.external?.targets) ? residency.external.targets : [],
     ollama: Array.isArray(residency.ollama?.models) ? residency.ollama.models.filter(Boolean) : [],
   };
+}
+
+function selectedModelSupportsVramHandoff() {
+  const model = studio?.selectedModel;
+  return ["gguf", "external"].includes(model?.family)
+    || (model?.family === "ollama" && isLocalOllamaHost(studio.ollamaHost));
+}
+
+function vramHandoffIsEnabled() {
+  if (!VRAM_HANDOFF_SUPPORTED) return false;
+  if (studio) return studio.vramHandoff;
+  const preferences = loadUserPreferences(localStorage);
+  return preferences?.vram_handoff === true;
+}
+
+function vramHandoffOllamaHost() {
+  return studio?.ollamaHost || loadOllamaHost(localStorage);
+}
+
+function writerAutoVramApplies() {
+  return vramHandoffIsEnabled() && selectedModelSupportsVramHandoff();
+}
+
+function writerAttemptIsCurrent(token) {
+  return token == null || vramHandoffCoordinator.isWriterAttemptCurrent(token);
+}
+
+async function prepareWriterVram(token) {
+  if (token == null) return true;
+  studio.vramHandoffInFlight = true;
+  setGenerationState("busy", "Freeing VRAM", "Preparing ComfyUI memory for the prompt model");
+  try {
+    await releaseComfyVramWhenIdle({
+      getStatus,
+      freeComfyVram,
+      ollamaHost: studio.ollamaHost,
+      isCurrent: () => writerAttemptIsCurrent(token),
+      onStatus: (status) => {
+        studio.gpuMemory = status.gpu_memory || studio.gpuMemory;
+        updatePromptResidency(status);
+      },
+    });
+    return writerAttemptIsCurrent(token);
+  } catch (error) {
+    if (error.code !== "WRITER_PREPARATION_CANCELLED") {
+      showToast("Auto VRAM could not prepare memory", error.message, error.details);
+    }
+    setGenerationState("idle", "", "");
+    return false;
+  } finally {
+    studio.vramHandoffInFlight = false;
+  }
+}
+
+async function prepareWriterRequest() {
+  const token = writerAutoVramApplies() ? vramHandoffCoordinator.beginWriterAttempt() : null;
+  if (!await inspectDirectRuntime() || !writerAttemptIsCurrent(token)) return false;
+  if (!await prepareWriterVram(token)) return false;
+  if (writerAttemptIsCurrent(token)) return true;
+  setGenerationState("idle", "", "");
+  return false;
+}
+
+function markActiveWriterRequest() {
+  studio.activeRequestFamily = studio.selectedModel.family;
+  studio.activeRequestModelId = studio.selectedModel.family === "ollama" ? studio.selectedModel.remote_model : studio.selectedModel.id;
+  studio.activeRequestOllamaHost = studio.selectedModel.family === "ollama" ? studio.ollamaHost : null;
+}
+
+function clearActiveWriterRequest() {
+  studio.activeRequestFamily = null;
+  studio.activeRequestModelId = null;
+  studio.activeRequestOllamaHost = null;
+}
+
+async function unloadWriterModelsBeforeQueue(signal) {
+  const ollamaHost = vramHandoffOllamaHost();
+  const activeRequest = vramHandoffCoordinator.activeWriterRequest();
+  const activeFamily = studio?.activeRequestFamily;
+  const activeLocal = activeFamily === "gguf"
+    || (activeFamily === "external" && studio?.selectedModel?.lifecycle_supported)
+    || (activeFamily === "ollama" && isLocalOllamaHost(studio?.activeRequestOllamaHost || ollamaHost));
+  const requiredTargets = [];
+  if (activeRequest && activeLocal) {
+    const target = {
+      family: activeFamily,
+      model_id: studio.activeRequestModelId,
+      ollama_host: activeFamily === "ollama" ? (studio.activeRequestOllamaHost || ollamaHost) : null,
+    };
+    if(activeFamily === "external") requiredTargets.push(target);
+    const result = await unloadModel(target);
+    if (result?.unload_requested === false) throw new Error("Prompt Writer could not stop and unload its local model.");
+    try { await activeRequest; } catch {}
+  }
+  signal?.throwIfAborted();
+  await unloadWriterModels({
+    signal,
+    requiredTargets,
+    getStatus,
+    unloadModel,
+    ollamaHost,
+    onStatus: (status) => { if (studio) updatePromptResidency(status); },
+  });
+  if (studio) syncLifecycleActions();
+}
+
+function showVramHandoffQueueError(error) {
+  const message = error.message || "Prompt Writer could not release its local model.";
+  if (studio?.root.classList.contains("is-open")) {
+    showToast("Queue continuing without VRAM release", message, error.details);
+  } else {
+    app.extensionManager?.toast?.add({severity:"warn", summary:"Auto VRAM: Queue continuing", detail:message, life:8000});
+  }
 }
 
 function lifecycleTargets() {
   const targets = [];
   if (studio.promptResidency.direct) targets.push({ family: "gguf", modelId: studio.promptResidency.direct.modelId });
   studio.promptResidency.ollama.forEach((modelId) => targets.push({ family: "ollama", modelId, endpoint: studio.ollamaHost }));
+  const selected = studio.selectedModel;
+  const external = (studio.promptResidency.external || []).filter(t => t.writer_owned || t.model_id === selected?.id);
+  if (selected?.family === "external" && selected.lifecycle_supported && !external.some(t => t.model_id === selected.id)) {
+    external.push({model_id:selected.id, state:"unknown", writer_owned:false});
+  }
+  external.forEach(target => targets.push({family:"external", modelId:target.model_id, state:target.state, writerOwned:target.writer_owned}));
   return targets;
 }
 
 function lifecycleButtonMarkup(target, { stop = false } = {}) {
-  const provider = target.family === "ollama" ? "ollama" : "direct";
-  const label = stop ? "Stop & unload" : target.family === "ollama" ? "Unload Ollama" : "Unload Direct";
+  const provider = target.family === "external" ? "external" : target.family === "ollama" ? "ollama" : "direct";
+  const disabled = target.family === "external" && (["loading","unloading","unloaded"].includes(target.state) || (target.state === "unknown" && !target.writerOwned));
+  const label = target.state === "unloading" ? "Unloading…" : target.state === "loading" ? "Loading…" : stop ? "Stop & unload" : target.family === "external" ? "Unload" : target.family === "ollama" ? "Unload Ollama" : "Unload Direct";
   const title = stop
     ? "Cancel the active request and unload its prompt model"
     : `Unload ${target.modelId || (target.family === "ollama" ? "the Ollama model" : "the Direct model")}`;
-  return `<button class="h3ps-memory-action h3ps-prompt-lifecycle-action" type="button" data-lifecycle-family="${target.family}" ${target.modelId ? `data-lifecycle-model="${escapeHtml(target.modelId)}"` : ""} data-lifecycle-stop="${stop}" title="${escapeHtml(title)}"><span class="h3ps-provider-icon" data-provider-icon="${provider}" aria-hidden="true"></span>${label}</button>`;
+  return `<button class="h3ps-memory-action h3ps-prompt-lifecycle-action" type="button" data-lifecycle-family="${target.family}" ${disabled ? "disabled" : ""} ${target.modelId ? `data-lifecycle-model="${escapeHtml(target.modelId)}"` : ""} data-lifecycle-stop="${stop}" title="${escapeHtml(title)}"><span class="h3ps-provider-icon" data-provider-icon="${provider}" aria-hidden="true"></span>${label}</button>`;
 }
 
 function syncLifecycleActions() {
@@ -1069,8 +1332,8 @@ function syncLifecycleActions() {
   const directStatus = studio.root.querySelector("[data-model-lifecycle]");
   if (directStatus) directStatus.hidden = !studio.promptResidency.direct;
   const activeFamily = studio.activeRequestFamily;
-  const activeLocal = studio.requestBusy && ["gguf", "ollama"].includes(activeFamily);
-  const activeTarget = activeLocal ? { family: activeFamily, modelId: studio.activeRequestModelId } : null;
+  const activeLocal = studio.requestBusy && (["gguf", "ollama"].includes(activeFamily) || (activeFamily === "external" && studio.selectedModel?.lifecycle_supported));
+  const activeTarget = activeLocal && activeFamily !== "external" ? { family: activeFamily, modelId: studio.activeRequestModelId } : null;
   const background = lifecycleTargets().filter((target) => {
     if (!activeTarget) return true;
     if (activeTarget.family === "gguf" && target.family === "gguf") return false;
@@ -1084,6 +1347,7 @@ function syncLifecycleActions() {
 }
 
 async function releaseComfyVram({ retry = null, requiredFreeMb = null } = {}) {
+  if (!HOST_CAPABILITIES.comfyMemory) return;
   const button = studio.root.querySelector("[data-comfy-memory-action]");
   if (button.disabled || studio.comfyVramReleaseInFlight) return;
   let shouldRetry = false;
@@ -1094,6 +1358,11 @@ async function releaseComfyVram({ retry = null, requiredFreeMb = null } = {}) {
     const before = await getStatus(studio.ollamaHost);
     const beforeFree = Number(before.gpu_memory?.free_mb);
     const requiredFree = requiredFreeMb == null ? null : Number(requiredFreeMb);
+    if (typeof retry !== "function" && requiredFree == null && comfyVramIsAlreadyEmpty(before)) {
+      studio.gpuMemory = before.gpu_memory || studio.gpuMemory;
+      showToast("No ComfyUI models loaded", "VRAM is already free for Prompt Writer.");
+      return;
+    }
     await freeComfyVram();
 
     let latest = before;
@@ -1136,12 +1405,10 @@ function showVramRetry(error, retry) {
   const message = Number.isFinite(freeGb) && Number.isFinite(requiredGb)
     ? `${freeGb.toFixed(1)} GB is free; this runtime needs about ${requiredGb.toFixed(1)} GB.`
     : error.message;
-  showToast(
-    "Not enough free VRAM",
-    message,
-    null,
-    { label: "Free ComfyUI VRAM & retry", onClick: () => releaseComfyVram({ retry, requiredFreeMb: error.details?.required_free_mb }) },
-  );
+  const action = !HOST_CAPABILITIES.comfyMemory || writerAutoVramApplies()
+    ? null
+    : { label: "Free ComfyUI VRAM & retry", onClick: () => releaseComfyVram({ retry, requiredFreeMb: error.details?.required_free_mb }) };
+  showToast("Not enough free VRAM", message, null, action);
 }
 
 async function runLifecycleAction(event) {
@@ -1152,15 +1419,25 @@ async function runLifecycleAction(event) {
   const stop = button.dataset.lifecycleStop === "true";
   if (stop) setGenerationState("busy", "Stopping & unloading", "Cancelling the request and unloading its prompt model");
   button.disabled = true;
+  if (family === "external") {
+    const target = studio.promptResidency.external?.find(t => t.model_id === modelId);
+    if (target) target.state = "unloading";
+    button.textContent = "Unloading…";
+  }
   try {
     await unloadModel({ family, model_id: modelId, ollama_host: family === "ollama" ? studio.ollamaHost : null });
     if (family === "gguf") studio.promptResidency.direct = null;
-    else studio.promptResidency.ollama = studio.promptResidency.ollama.filter((name) => name !== modelId);
+    else if(family === "external" && !stop) studio.promptResidency.external = (studio.promptResidency.external||[]).map(t=>t.model_id===modelId ? {...t,state:"unloaded",writer_owned:false} : t);
+    else if(family === "ollama") studio.promptResidency.ollama = studio.promptResidency.ollama.filter((name) => name !== modelId);
     showToast(
-      stop ? "Stop & unload requested" : family === "ollama" ? "Ollama model unloaded" : "Direct model unloaded",
+      stop ? "Stop & unload requested" : family === "external" ? "External model unloaded" : family === "ollama" ? "Ollama model unloaded" : "Direct model unloaded",
       stop ? "The request will stop and release its model at the next safe point." : "GPU memory used by the prompt model was released.",
     );
   } catch (error) {
+    if (family === "external") {
+      const target = studio.promptResidency.external?.find(t => t.model_id === modelId);
+      if (target) target.state = "unknown";
+    }
     showToast(error.code || "Unload failed", error.message, error.details);
   } finally {
     button.disabled = false;
@@ -1169,6 +1446,7 @@ async function runLifecycleAction(event) {
 }
 
 async function startGenerationPreview() {
+  if (studio.vramHandoffInFlight) return;
   if (studio.requestBusy) {
     setGenerationState("busy", "Cancelling", "Stopping after the current token");
     await cancel();
@@ -1183,28 +1461,29 @@ async function startGenerationPreview() {
     return;
   }
   if (!generationModeIsAvailable()) return;
-  if (!await inspectDirectRuntime()) return;
+  if (!await prepareWriterRequest()) return;
   const modelName = studio.selectedModel.name.split("/").pop();
   const external = studio.selectedModel.family === "external";
   const apiProvider = studio.selectedModel.family === "api";
   const remote = external || apiProvider;
-  studio.activeRequestFamily = studio.selectedModel.family;
-  studio.activeRequestModelId = studio.selectedModel.family === "ollama" ? studio.selectedModel.remote_model : studio.selectedModel.id;
+  markActiveWriterRequest();
   const generationDetail = external ? `${modelName} · the server may load its model if idle` : apiProvider ? `${modelName} · ${studio.selectedModel.api_preset}` : modelName;
   setGenerationState("busy", remote ? "Contacting provider" : "Loading model", generationDetail);
+  let pollingActive = true;
   studio.statusTimer = setInterval(async () => {
     try {
       const status = await getStatus(studio.ollamaHost);
+      if (!pollingActive) return;
       const labels = { loading_model: remote ? "Contacting provider" : "Loading model", processing_media: "Processing references", generating: "Generating", cancelling: "Cancelling" };
       if (labels[status.phase]) setGenerationState("busy", labels[status.phase], generationDetail);
     } catch {}
   }, 650);
   try {
-    const result = await generate(buildGeneratePayload(studio, {
+    const result = await vramHandoffCoordinator.trackWriterRequest(generate(buildGeneratePayload(studio, {
       creativeBrief: currentBriefTextarea().value,
       lyrics: studio.mode === "Music3" ? studio.root.querySelector("[data-music-lyrics]").value : "",
       seed: newGenerationSeed(),
-    }));
+    })));
     const output = studio.root.querySelector("[data-output]");
     output.value = result.prompt;
     studio.lastModelPrompt = result.prompt;
@@ -1226,10 +1505,17 @@ async function startGenerationPreview() {
     } else if (result.format_repair_failure) {
       showToast("Prompt generated with a format warning", `The first draft failed ${result.format_repair_reason}; the safe repair was rejected because ${result.format_repair_failure}.`, null, null, { dismissOnWorkspaceClick: true });
     } else {
-      const reasoning = result.api_provider ? "Reasoning provider managed" : `Thinking ${result.thinking ? "on" : "off"}`;
-      showToast(studio.mode === "Music3" ? "Caption generated" : "Prompt generated", `${result.total_seconds.toFixed(1)}s · ${result.tokens_per_second.toFixed(1)} tok/s · ${reasoning}`);
+      const details = [
+        `${result.total_seconds.toFixed(1)}s`,
+        `${result.tokens_per_second.toFixed(1)} tok/s`,
+        result.api_provider ? "Reasoning provider managed" : external ? null : `Thinking ${result.thinking ? "on" : "off"}`,
+      ];
+      showToast(studio.mode === "Music3" ? "Caption generated" : "Prompt generated", details.filter(Boolean).join(" · "));
     }
+    studio.desktopNotifications.notify("Generation finished. Your prompt is ready.");
+    if (result.lifecycle_warning) showToast("Model cleanup", result.lifecycle_warning, null, null, {dismissOnWorkspaceClick:true});
   } catch (error) {
+    if (error.code !== "GENERATION_CANCELLED") studio.desktopNotifications.notify("Generation failed. Open Writer for details.");
     if (error.code === "GENERATION_CANCELLED") {
       showToast("Generation cancelled", "The active request stopped.");
     } else if (error.code === "INSUFFICIENT_FREE_VRAM") {
@@ -1255,14 +1541,14 @@ async function startGenerationPreview() {
       showToast(error.code || "Generation failed", error.message, error.details);
     }
   } finally {
+    pollingActive = false;
     clearInterval(studio.statusTimer);
     studio.statusTimer = null;
     try {
       const status = await getStatus(studio.ollamaHost);
       updatePromptResidency(status);
     } catch {}
-    studio.activeRequestFamily = null;
-    studio.activeRequestModelId = null;
+    clearActiveWriterRequest();
     setGenerationState("idle", "", "");
   }
 }
@@ -1474,7 +1760,7 @@ function renderExternalServerControl() {
   const connected = studio.externalModel;
   const config = studio.externalServerConfig || { url: "http://127.0.0.1:8080", model: "" };
   const title = connected ? connected.name.split("/").pop() : "External llama.cpp server";
-  const contextLabel = Number.isFinite(connected?.server_context_tokens)
+  const contextLabel = connected?.context_verified !== false && Number.isFinite(connected?.server_context_tokens)
     ? ` · ${Math.round(connected.server_context_tokens / 1024)}K context`
     : "";
   const state = connected
@@ -1491,8 +1777,9 @@ function renderExternalServerControl() {
       </div>
       <form data-external-server-form>
         <label><span>Server URL</span><input name="url" type="url" value="${escapeHtml(config.url)}" placeholder="http://127.0.0.1:8080" required></label>
-        <label><span>Model ID <em>optional</em></span><input name="model" type="text" value="${escapeHtml(config.model)}" placeholder="Use the first loaded model"></label>
-        <small>Localhost only. Context, KV cache and model loading stay under server control.</small>
+        <label><span>Model ID <em>optional</em></span><input name="model" type="text" value="${escapeHtml(config.model)}" placeholder="Required when the server lists multiple models"></label>
+        <label><span>API key <em>optional</em></span><input name="api_key" type="password" autocomplete="off" placeholder="Blank reuses the key held in server memory"></label>
+        <small>Localhost only. Context and KV cache stay server-managed. Model lifecycle controls require a llama.cpp router.</small>
         <div><button type="button" data-external-server-disconnect ${connected || studio.externalServerConfig ? "" : "hidden"}>Disconnect</button><span></span><button type="submit">${connected ? "Reconnect" : "Connect"}</button></div>
       </form>
     </div>`;
@@ -1510,12 +1797,12 @@ function ollamaModelForSettings() {
   return models.find((model) => model.remote_model === studio.ollamaModelName) || models[0] || null;
 }
 
-function ollamaHostControlMarkup() {
+function ollamaHostControlMarkup(hostValue = studio.ollamaHost) {
   const custom = studio.ollamaHost !== DEFAULT_OLLAMA_HOST;
   return `<details class="h3ps-ollama-host-settings" data-ollama-host-settings ${studio.ollamaHostSettingsOpen ? "open" : ""}>
     <summary>${custom ? `Remote host · ${escapeHtml(studio.ollamaHost)}` : "Use Ollama on another computer"}</summary>
     <form data-ollama-host-form>
-      <label><span>Host URL</span><input name="host" type="url" value="${escapeHtml(studio.ollamaHost)}" placeholder="${DEFAULT_OLLAMA_HOST}" required></label>
+      <label><span>Host URL</span><input name="host" type="url" value="${escapeHtml(hostValue)}" placeholder="${DEFAULT_OLLAMA_HOST}" required></label>
       <button type="submit">Apply</button>
     </form>
     <small>Keep the default URL for Ollama on this computer. Remote hosts must allow connections from this machine.</small>
@@ -1551,9 +1838,9 @@ function renderOllamaModelTiers(status) {
   }).join("")}</div>`;
 }
 
-function renderOllamaProviderControl() {
+function renderOllamaProviderControl(hostValue) {
   const status = studio.ollamaStatus;
-  const hostControl = ollamaHostControlMarkup();
+  const hostControl = ollamaHostControlMarkup(hostValue);
   const remoteHost = studio.ollamaHost !== DEFAULT_OLLAMA_HOST;
   const serviceLabel = remoteHost ? "Remote service" : "Local service";
   if (!status) {
@@ -1627,6 +1914,36 @@ function apiProviderModelForSettings() {
     || null;
 }
 
+function apiSamplingMarkup(model, config) {
+  const allowed = model?.sampling_parameters || [];
+  const values = safeApiSampling(config.sampling, allowed);
+  if (!allowed.length) return `<details class="h3ps-api-sampling"><summary>Sampling · provider defaults</summary><p>This provider/model uses managed sampling or does not advertise supported controls.</p></details>`;
+  return `<details class="h3ps-api-sampling"><summary>Sampling · ${Object.keys(values).length ? "custom" : "provider defaults"}</summary>
+    <p>Leave a field empty to use the provider default. Changes apply to the next Generate or Refine request.</p>
+    <form data-api-sampling-form><div class="h3ps-api-sampling-fields">${API_SAMPLING_FIELDS.map(({ name, label, min, max, step }) => `<label><span>${label}</span><input type="number" name="${name}" min="${min}" ${max == null ? "" : `max="${max}"`} step="${step}" value="${values[name] ?? ""}" placeholder="${allowed.includes(name) ? "Provider default" : "Not supported"}" ${allowed.includes(name) ? "" : "disabled"}></label>`).join("")}</div>
+    <small>${config.preset === "custom" ? "Custom endpoints may reject parameters their model does not support. Clear that field if the provider rejects it." : "Available controls come from the model's reported capabilities."}</small>
+    <div class="h3ps-api-actions"><button type="button" data-api-sampling-reset>Reset to provider defaults</button><button type="submit">Save sampling</button></div></form></details>`;
+}
+
+function saveApiSampling(form, reset = false) {
+  if (!reset && !form.reportValidity()) return;
+  const allowed = apiProviderModelForSettings()?.sampling_parameters || [];
+  const values = {};
+  if (!reset) for (const name of allowed) {
+    const input = form.elements.namedItem(name);
+    if (input && input.value !== "") values[name] = input.valueAsNumber;
+  }
+  studio.apiProviderConfig.sampling = safeApiSampling(values, allowed);
+  saveApiProviderConfig(localStorage, studio.apiProviderConfig);
+  renderInferenceSettings();
+  const panel = studio.root.querySelector(".h3ps-api-sampling");
+  if (panel) {
+    panel.open = true;
+    panel.querySelector(reset ? "[data-api-sampling-reset]" : '[type="submit"]')?.focus();
+  }
+  showToast("Sampling saved", reset ? "Using provider defaults." : "Applies to the next API request.");
+}
+
 function renderApiProviderControl() {
   const config = studio.apiProviderConfig;
   const selectedPreset = API_PROVIDER_UI[config.preset] || API_PROVIDER_UI.gemini;
@@ -1656,6 +1973,7 @@ function renderApiProviderControl() {
         <label class="h3ps-api-model-select"><span>Model</span><select data-api-model>${models.map((item) => `<option value="${escapeHtml(item.remote_model)}" ${item.remote_model === model?.remote_model ? "selected" : ""}>${escapeHtml(item.name)}${item.model_context_limit ? ` · ${Math.round(item.model_context_limit / 1024)}K` : ""}</option>`).join("")}</select></label>
         <div class="h3ps-api-badges"><span class="${model?.capabilities?.images ? "is-ready" : ""}">${model?.capabilities?.images ? "Vision" : "Text only / unknown"}</span><span>${config.preset === "gemini" ? `Thinking ${escapeHtml(connection.reasoning_effort || "minimal")}` : "Reasoning provider managed"}</span><span>Provider managed</span></div>
         <div class="h3ps-api-actions"><span>${policyLinks}</span><button type="button" data-api-model-refresh>${icon("refresh", 13)} Refresh models</button><button type="button" data-api-disconnect>Disconnect</button></div>
+        ${apiSamplingMarkup(model, config)}
         ${disclosure}
         <p class="h3ps-api-cancel-note">Stop aborts H3's connection. The remote provider may continue processing or billing.</p>
       </div>
@@ -1680,32 +1998,19 @@ function renderApiProviderControl() {
 function setOtherModelsPopover(open) {
   if (!studio) return;
   const popover = studio.root.querySelector("[data-other-models-popover]");
+  const backdrop = studio.root.querySelector("[data-other-models-backdrop]");
   const trigger = studio.root.querySelector("[data-other-models-toggle]");
   if (!popover) return;
   popover.hidden = !open;
+  if (open) popover.setAttribute("aria-modal", "true");
+  else popover.removeAttribute("aria-modal");
+  if (backdrop) backdrop.hidden = !open;
   trigger?.setAttribute("aria-expanded", String(open));
-  if (open) requestAnimationFrame(positionOtherModelsPopover);
-}
-
-function positionOtherModelsPopover() {
-  const popover = studio?.root.querySelector("[data-other-models-popover]");
-  const trigger = studio?.root.querySelector("[data-other-models-toggle]");
-  const panel = studio?.root.querySelector('[data-provider-panel="direct"]');
-  if (!popover || popover.hidden || !trigger || !panel) return;
-  const margin = 12;
-  const gap = 8;
-  const panelRect = panel.getBoundingClientRect();
-  const triggerRect = trigger.getBoundingClientRect();
-  const width = Math.min(panelRect.width, 560, window.innerWidth - margin * 2);
-  popover.style.width = `${width}px`;
-  const maxHeight = Math.min(window.innerHeight * 0.62, 520, window.innerHeight - margin * 2);
-  const height = Math.min(popover.scrollHeight, maxHeight);
-  let left = triggerRect.right + gap;
-  if (left + width > window.innerWidth - margin) left = triggerRect.left - width - gap;
-  left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
-  const top = Math.max(margin, Math.min(triggerRect.top, window.innerHeight - height - margin));
-  popover.style.left = `${left}px`;
-  popover.style.top = `${top}px`;
+  if (open) {
+    scheduleStudioFocus(() => popover.querySelector("[data-other-models-close]"));
+  } else if (popover.contains(document.activeElement)) {
+    trigger?.focus();
+  }
 }
 
 function localModels() {
@@ -1731,7 +2036,18 @@ function syncProviderSettings() {
     panel.hidden = panel.dataset.providerPanel !== provider;
   });
   const runtimeSettings = studio.root.querySelector(".h3ps-runtime-settings");
-  runtimeSettings.hidden = provider !== "direct";
+  runtimeSettings.hidden = !["direct", "ollama"].includes(provider);
+  runtimeSettings.querySelector("[data-ollama-context]").hidden = provider !== "ollama";
+  const ollamaContext = runtimeSettings.querySelector("[data-ollama-context-input]");
+  if (ollamaContext !== document.activeElement) ollamaContext.value = studio.ollamaContextTokens ?? "";
+  const limit = studio.selectedModel?.family === "ollama" && studio.selectedModel.model_context_limit;
+  if (limit) ollamaContext.max = String(limit);
+  else ollamaContext.removeAttribute("max");
+  runtimeSettings.querySelector('[data-runtime-toggle="context"]').closest(".h3ps-runtime-control").hidden = provider !== "direct";
+  runtimeSettings.querySelector('[data-runtime-toggle="kv"]').closest(".h3ps-runtime-control").hidden = provider !== "direct";
+  runtimeSettings.querySelector("[data-runtime-management]").textContent = provider === "ollama"
+    ? "Leave Context empty for Auto, or enter a token count within the model's limit. Generation budget sets the reply length."
+    : "Direct GGUF runtime settings are applied to the next request.";
 }
 
 function directModelRuntimeSuffix(model) {
@@ -1757,9 +2073,42 @@ function renderDirectModelRuntimeUpdate(model) {
   </section>`;
 }
 
+function projectorChoices() {
+  try {
+    const value = JSON.parse(localStorage.getItem("h3-writer-projectors") || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch { return {}; }
+}
+
+function renderProjectorChoice(model) {
+  const slot = studio.root.querySelector("[data-direct-projector]");
+  const choices = model?.projector_candidates || [];
+  slot.replaceChildren();
+  if (choices.length < 2) return;
+  slot.innerHTML = `<label class="h3ps-field"><span>Vision projector</span><select aria-label="Vision projector"><option value="">Choose a compatible projector…</option>${choices.map(path => `<option value="${escapeHtml(path)}" ${path === model.selected_projector ? "selected" : ""}>${escapeHtml(path.split(/[\\/]/).pop())}</option>`).join("")}</select></label><p class="h3ps-direct-model-note">Several projectors match this model. Choose the intended file.</p>`;
+  const select = slot.querySelector("select");
+  select.addEventListener("change", async () => {
+    const revision = studio.modelSelectionRevision;
+    const path = select.value;
+    if (!path || studio.requestBusy) return;
+    select.disabled = true;
+    try {
+      const result = await selectProjector(model.id, path);
+      if (studio.requestBusy || revision !== studio.modelSelectionRevision || directModelForSettings()?.id !== model.id) return;
+      const saved = projectorChoices(); saved[model.id] = path;
+      localStorage.setItem("h3-writer-projectors", JSON.stringify(saved));
+      studio.models = studio.models.map(m => m.id === model.id ? result.model : m);
+      selectModel(result.model);
+    } catch (error) { showToast("Projector selection", error.message); }
+    finally { if (select.isConnected) select.disabled = false; }
+  });
+}
+
 function renderInferenceSettings() {
+  const ollamaHostDraft = studio.root.querySelector('[data-ollama-host-form] input[name="host"]')?.value;
   const models = localModels();
   const directModel = directModelForSettings();
+  renderProjectorChoice(directModel);
   const select = studio.root.querySelector("[data-installed-model]");
   select.disabled = !models.length;
   select.innerHTML = models.length
@@ -1786,7 +2135,7 @@ function renderInferenceSettings() {
       : runtimeRequirement.state === "update_required"
         ? renderDirectModelRuntimeUpdate(directModel)
         : isTextOnlyDirectModel(directModel)
-          ? `<div class="h3ps-direct-model-note"><strong>Text-only model · T2VA available</strong><span>${escapeHtml(directModel.capability_message || "No compatible vision projector is active.")}</span></div>`
+          ? `<div class="h3ps-direct-model-note"><strong>Text-only model · T2VA and Music3 available</strong><span>${escapeHtml(directModel.capability_message || "No compatible vision projector is active.")}</span></div>`
           : "";
   } else {
     directStatus.innerHTML = "";
@@ -1794,7 +2143,7 @@ function renderInferenceSettings() {
   studio.root.querySelector("[data-model-scan-slot]").innerHTML = renderModelScanDetails();
   studio.root.querySelector("[data-verified-models-slot]").innerHTML = studio.modelSetup.length ? renderOtherModelsTrigger() : "";
   studio.root.querySelector("[data-external-provider-control]").innerHTML = renderExternalServerControl();
-  studio.root.querySelector("[data-ollama-provider-control]").innerHTML = renderOllamaProviderControl();
+  studio.root.querySelector("[data-ollama-provider-control]").innerHTML = renderOllamaProviderControl(ollamaHostDraft);
   studio.root.querySelector("[data-api-provider-control]").innerHTML = renderApiProviderControl();
   const catalog = studio.root.querySelector("[data-other-models-catalog]");
   catalog.innerHTML = `<div class="h3ps-model-setup-list">${renderModelSetupRows()}</div>`;
@@ -1834,6 +2183,7 @@ async function refreshGGUFRuntimeDiagnostics(force = false) {
 }
 
 function selectSettingsProvider(provider) {
+  studio.modelSelectionRevision = (studio.modelSelectionRevision || 0) + 1;
   setOtherModelsPopover(false);
   rememberRuntimePreferences();
   studio.settingsProvider = ["direct", "external", "ollama", "api"].includes(provider) ? provider : "direct";
@@ -1874,6 +2224,7 @@ function selectSettingsProvider(provider) {
 }
 
 function selectModel(model, { preserveSettingsProvider = false } = {}) {
+  studio.modelSelectionRevision = (studio.modelSelectionRevision || 0) + 1;
   rememberRuntimePreferences();
   selectModelState(studio, model, { preserveSettingsProvider });
   const switchedToT2VA = !isGenerationModeAvailable(model, studio.mode);
@@ -1906,13 +2257,20 @@ function selectModel(model, { preserveSettingsProvider = false } = {}) {
     studio.contextProfile = "auto";
     studio.kvCache = "auto";
     studio.thinking = false;
+    if (studio.apiProviderConfig.model_id !== model.remote_model) studio.apiProviderConfig.sampling = {};
     studio.apiProviderConfig.model_id = model.remote_model;
     saveApiProviderConfig(localStorage, studio.apiProviderConfig);
   }
   const keepLoaded = studio.root.querySelector("[data-keep-loaded]");
   const keepLoadedControl = studio.root.querySelector("[data-keep-loaded-control]");
-  keepLoadedControl.hidden = remote;
+  const vramHandoff = studio.root.querySelector("[data-vram-handoff]");
+  const vramHandoffControl = studio.root.querySelector("[data-vram-handoff-control]");
+  keepLoadedControl.hidden = remote && !model?.lifecycle_supported;
   keepLoaded.checked = studio.keepModelLoaded;
+  if (vramHandoffControl && vramHandoff) {
+    vramHandoffControl.hidden = !selectedModelSupportsVramHandoff();
+    vramHandoff.checked = studio.vramHandoff;
+  }
   renderInferenceSettings();
   renderMedia(studio.mode);
   setOtherModelsPopover(false);
@@ -1936,6 +2294,9 @@ function rememberRuntimePreferences(provider = studio.settingsProvider) {
     studio.directGenerationBudget = studio.generationBudget;
     studio.directGenerationBudgetTokens = studio.generationBudgetTokens;
     studio.directReasoningEffort = studio.reasoningEffort;
+  } else if (provider === "ollama") {
+    studio.ollamaGenerationBudget = studio.generationBudget;
+    studio.ollamaGenerationBudgetTokens = studio.generationBudgetTokens;
   }
 }
 
@@ -1951,8 +2312,8 @@ function applyRuntimePreferences(provider) {
     studio.contextProfile = "auto";
     studio.contextTokens = null;
     studio.kvCache = "auto";
-    studio.generationBudget = "auto";
-    studio.generationBudgetTokens = null;
+    studio.generationBudget = provider === "ollama" ? studio.ollamaGenerationBudget : "auto";
+    studio.generationBudgetTokens = provider === "ollama" ? studio.ollamaGenerationBudgetTokens : null;
     studio.reasoningEffort = "auto";
   }
 }
@@ -1967,8 +2328,10 @@ function syncThinkingAvailability() {
   const label = input.closest("label");
   const unsupported = ["ollama", "gguf"].includes(studio.selectedModel?.family)
     && studio.selectedModel.thinking !== true;
-  const customTooSmall = context === "custom" && Number(studio.contextTokens || 0) < 16384;
-  const disabled = apiManaged || externalManaged || unsupported || (context !== "auto" && (resolved === "low" || customTooSmall));
+  const customTooSmall = studio.selectedModel?.family === "ollama"
+    ? studio.ollamaContextTokens != null && studio.ollamaContextTokens < 16384
+    : context === "custom" && Number(studio.contextTokens || 0) < 16384;
+  const disabled = apiManaged || externalManaged || unsupported || customTooSmall || (context !== "auto" && resolved === "low");
   if (disabled) input.checked = false;
   if (disabled) studio.thinking = false;
   input.checked = studio.thinking;
@@ -1976,7 +2339,7 @@ function syncThinkingAvailability() {
   label.hidden = apiManaged;
   label.classList.toggle("is-disabled", disabled);
   label.title = externalManaged
-    ? "Thinking is managed by the external llama.cpp server."
+    ? "Thinking is controlled by the external llama.cpp server. Start it with --reasoning on --reasoning-effort low to enable, or --reasoning off to disable."
     : unsupported
     ? "This provider model does not report thinking controls."
     : disabled ? "Thinking needs 16K or larger Context." : "";
@@ -2004,7 +2367,8 @@ function syncContextAvailability() {
 function syncAdvancedRuntimeControls() {
   const direct = studio.selectedModel?.family === "gguf";
   const advanced = studio.root.querySelector("[data-direct-runtime-advanced]");
-  advanced.hidden = !direct;
+  const ollama = studio.settingsProvider === "ollama";
+  advanced.hidden = !direct && !ollama;
   const customContext = studio.root.querySelector("[data-custom-context]");
   customContext.hidden = !direct || studio.contextProfile !== "custom";
   const contextInput = studio.root.querySelector("[data-custom-context-input]");
@@ -2014,7 +2378,7 @@ function syncAdvancedRuntimeControls() {
   else contextInput.removeAttribute("max");
 
   const customBudget = studio.root.querySelector("[data-custom-generation-budget]");
-  customBudget.hidden = !direct || studio.generationBudget !== "custom";
+  customBudget.hidden = (!direct && !ollama) || studio.generationBudget !== "custom";
   studio.root.querySelector("[data-custom-generation-budget-input]").value = studio.generationBudgetTokens || "";
 
   const values = direct ? (studio.selectedModel?.reasoning_effort_values || []) : [];
@@ -2038,13 +2402,30 @@ function syncAdvancedRuntimeControls() {
   menu.querySelectorAll('[data-runtime-option="reasoning"]').forEach((button) => button.addEventListener("click", (event) => applyRuntimeOption(button, event)));
 }
 
+function setRuntimeMenuOpen(name, open, restoreFocus = false) {
+  if (!studio) return;
+  const menu = studio.root.querySelector(`[data-runtime-menu="${name}"]`);
+  const toggle = studio.root.querySelector(`[data-runtime-toggle="${name}"]`);
+  if (!menu) return;
+  menu.hidden = !open;
+  toggle?.setAttribute("aria-expanded", String(open));
+  if (!open && restoreFocus) toggle?.focus({ preventScroll: true });
+}
+
+function closeRuntimeMenus(exceptName = null) {
+  if (!studio) return;
+  studio.root.querySelectorAll("[data-runtime-menu]").forEach((menu) => {
+    if (menu.dataset.runtimeMenu !== exceptName) setRuntimeMenuOpen(menu.dataset.runtimeMenu, false);
+  });
+}
+
 function applyRuntimeOption(button, event) {
   event.preventDefault();
   if (button.dataset.runtimeOption === "context") studio.contextProfile = button.dataset.value;
   else if (button.dataset.runtimeOption === "kv") studio.kvCache = button.dataset.value;
   else if (button.dataset.runtimeOption === "budget") studio.generationBudget = button.dataset.value;
   else studio.reasoningEffort = button.dataset.value;
-  button.closest("[data-runtime-menu]").hidden = true;
+  setRuntimeMenuOpen(button.dataset.runtimeOption, false, true);
   syncRuntimeSummary();
   syncThinkingAvailability();
   rememberRuntimePreferences();
@@ -2067,8 +2448,8 @@ function syncRuntimeSummary(result = null) {
     const tokens = result?.context_tokens || studio.selectedModel.server_context_tokens;
     activeSummary = tokens ? `Server · ${Math.round(tokens / 1024)}K` : "Server managed";
   } else if (studio.selectedModel?.family === "ollama") {
-    const tokens = result?.context_tokens || (studio.contextProfile === "auto" ? null : ({ low: 8192, standard: 16384, extended: 24576, large: 32768, maximum: 49152 }[studio.contextProfile]));
-    activeSummary = tokens ? `Ollama · ${Math.round(tokens / 1024)}K` : "Ollama · Auto";
+    const tokens = result?.context_tokens || studio.ollamaContextTokens;
+    activeSummary = tokens ? `Ollama · ${tokens.toLocaleString()} tokens` : "Ollama · Auto";
   } else if (studio.selectedModel?.family === "api") {
     const tokens = result?.context_limit_known ? result.context_tokens : studio.selectedModel.model_context_limit;
     activeSummary = tokens ? `API · ${Math.round(tokens / 1024)}K` : "API · Provider managed";
@@ -2121,15 +2502,21 @@ function syncOllamaAutoDetection() {
 }
 
 async function connectExternalServer(form) {
+  studio.modelSelectionRevision = (studio.modelSelectionRevision || 0) + 1;
+  const attempt = (studio.externalConnectionAttempt || 0) + 1;
+  studio.externalConnectionAttempt = attempt;
+  const selectionRevision = studio.modelSelectionRevision || 0;
   const submit = form.querySelector('[type="submit"]');
   const config = {
     url: form.elements.url.value.trim(),
     model: form.elements.model.value.trim(),
+    ...(form.elements.api_key.value.trim() ? {api_key:form.elements.api_key.value.trim()} : {}),
   };
   submit.disabled = true;
   submit.textContent = "Connecting…";
   try {
     const result = await probeExternalServer(config);
+    if (studio.externalConnectionAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision) return;
     const saved = { url: result.model.endpoint, model: result.model.remote_model };
     studio.externalServerConfig = saved;
     studio.externalServerError = null;
@@ -2137,18 +2524,24 @@ async function connectExternalServer(form) {
     saveExternalServerConfig(localStorage, saved);
     studio.models = [...studio.models.filter((model) => model.family !== "external"), result.model];
     selectModel(result.model);
-    showToast("llama.cpp connected", `${result.model.name} · ${Math.round(result.model.server_context_tokens / 1024)}K context`);
+    const context = result.model.context_verified !== false
+      ? ` · ${Math.round(result.model.server_context_tokens / 1024)}K context` : "";
+    showToast("llama.cpp connected", `${result.model.name}${context}`);
   } catch (error) {
+    if (studio.externalConnectionAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision) return;
     studio.externalServerError = error;
     showToast(error.code || "Connection failed", error.message, error.details);
     renderInferenceSettings();
   } finally {
-    submit.disabled = false;
-    submit.textContent = "Connect";
+    if (studio.externalConnectionAttempt === attempt) {
+      submit.disabled = false;
+      submit.textContent = "Connect";
+    }
   }
 }
 
 function disconnectExternalServer() {
+  studio.externalConnectionAttempt = (studio.externalConnectionAttempt || 0) + 1;
   const wasSelected = studio.selectedModel?.family === "external";
   studio.externalServerConfig = null;
   studio.externalServerError = null;
@@ -2164,6 +2557,10 @@ function disconnectExternalServer() {
 }
 
 async function connectConfiguredApiProvider(form) {
+  studio.modelSelectionRevision = (studio.modelSelectionRevision || 0) + 1;
+  const attempt = (studio.apiConnectionAttempt || 0) + 1;
+  studio.apiConnectionAttempt = attempt;
+  const selectionRevision = studio.modelSelectionRevision || 0;
   const submit = form.querySelector('[type="submit"]');
   const contextValue = Number(form.elements.custom_context_tokens?.value || 0);
   const config = {
@@ -2173,6 +2570,8 @@ async function connectConfiguredApiProvider(form) {
     gemini_reasoning_effort: form.elements.gemini_reasoning_effort?.value || studio.apiProviderConfig.gemini_reasoning_effort || "minimal",
     custom_images: Boolean(form.elements.custom_images?.checked),
     custom_context_tokens: Number.isInteger(contextValue) && contextValue >= 4096 ? contextValue : null,
+    sampling: form.elements.model_id.value.trim() === studio.apiProviderConfig.model_id
+      ? safeApiSampling(studio.apiProviderConfig.sampling) : {},
   };
   submit.disabled = true;
   submit.textContent = "Connecting…";
@@ -2193,6 +2592,12 @@ async function connectConfiguredApiProvider(form) {
         reasoning_effort: config.gemini_reasoning_effort,
       },
     });
+    if (studio.apiConnectionAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision) {
+      if (result.connection.id !== studio.apiProviderConnection?.id) {
+        await disconnectApiProvider(result.connection.id).catch(() => {});
+      }
+      return;
+    }
     if (studio.apiProviderConnection?.id && studio.apiProviderConnection.id !== result.connection.id) {
       disconnectApiProvider(studio.apiProviderConnection.id).catch(() => {});
     }
@@ -2214,23 +2619,22 @@ async function connectConfiguredApiProvider(form) {
       model ? `${model.name} · ${model.capabilities?.images ? "vision ready" : "text only or vision unknown"}${result.connection.connection_verified ? "" : " · endpoint unverified"}` : "Connected. Enter an exact model ID or refresh the model list.",
     );
   } catch (error) {
+    if (studio.apiConnectionAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision) return;
     studio.apiProviderError = error;
     showToast(error.code || "API connection failed", error.message, error.details);
     renderInferenceSettings();
   } finally {
-    submit.disabled = false;
-    submit.textContent = "Connect & test";
+    if (studio.apiConnectionAttempt === attempt) {
+      submit.disabled = false;
+      submit.textContent = "Connect & test";
+    }
   }
 }
 
 async function disconnectConfiguredApiProvider({ announce = true } = {}) {
+  studio.apiConnectionAttempt = (studio.apiConnectionAttempt || 0) + 1;
   const connection = studio.apiProviderConnection;
   const wasSelected = studio.selectedModel?.family === "api";
-  if (connection?.id) {
-    try {
-      await disconnectApiProvider(connection.id);
-    } catch {}
-  }
   studio.apiProviderConnection = null;
   studio.apiProviderModels = [];
   studio.apiProviderError = null;
@@ -2241,16 +2645,23 @@ async function disconnectConfiguredApiProvider({ announce = true } = {}) {
   syncRuntimeSummary();
   saveUserPreferences(localStorage, studio);
   if (announce) showToast("API provider disconnected", "The session credential was removed from backend memory.");
+  if (connection?.id) {
+    try {
+      await disconnectApiProvider(connection.id);
+    } catch {}
+  }
 }
 
 async function chooseApiProviderPreset(preset) {
   if (!API_PROVIDER_UI[preset] || preset === studio.apiProviderConfig.preset) return;
-  if (studio.apiProviderConnection) await disconnectConfiguredApiProvider({ announce: false });
+  // Invalidate pending attempts even before the first connection exists.
+  void disconnectConfiguredApiProvider({ announce: false });
   studio.apiProviderConfig = {
     ...studio.apiProviderConfig,
     preset,
     base_url: "",
     model_id: "",
+    sampling: {},
     gemini_reasoning_effort: "minimal",
     custom_images: false,
     custom_context_tokens: null,
@@ -2262,8 +2673,12 @@ async function chooseApiProviderPreset(preset) {
 
 async function refreshApiProviderModels() {
   if (!studio.apiProviderConnection) return;
+  const attempt = (studio.apiConnectionAttempt || 0) + 1;
+  studio.apiConnectionAttempt = attempt;
+  const selectionRevision = studio.modelSelectionRevision || 0;
   try {
     const result = await getApiProviderModels(studio.apiProviderConnection.id);
+    if (studio.apiConnectionAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision) return;
     const selectedRemote = studio.selectedModel?.family === "api" ? studio.selectedModel.remote_model : studio.apiProviderConfig.model_id;
     studio.apiProviderConnection = result.connection;
     studio.apiProviderModels = result.models || [];
@@ -2273,12 +2688,17 @@ async function refreshApiProviderModels() {
     else renderInferenceSettings();
     showToast("API models refreshed", `${studio.apiProviderModels.length} model${studio.apiProviderModels.length === 1 ? "" : "s"} reported.`);
   } catch (error) {
+    if (studio.apiConnectionAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision) return;
     studio.apiProviderError = error;
     showToast(error.code || "Model refresh failed", error.message, error.details);
   }
 }
 
 async function refreshModels() {
+  const attempt = (studio.modelDiscoveryAttempt || 0) + 1;
+  studio.modelDiscoveryAttempt = attempt;
+  const selectionRevision = studio.modelSelectionRevision || 0;
+  const externalAttempt = studio.externalConnectionAttempt || 0;
   try {
     const [result, status, ollamaStatus, apiPresets] = await Promise.all([
       getModels(),
@@ -2286,28 +2706,42 @@ async function refreshModels() {
       getOllamaStatus(studio.ollamaHost).catch((error) => ({ state: "error", running: false, compatible_models: [], error: { code: error.code, message: error.message } })),
       getApiProviderPresets().catch(() => ({ presets: [] })),
     ]);
+    if (studio.modelDiscoveryAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision) return;
     const selectedId = studio.selectedModel?.id;
     const selectedBeforeRefresh = studio.selectedModel;
-    studio.ollamaStatus = ollamaStatus;
-    studio.ollamaError = ollamaStatus.error || null;
-    studio.apiProviderPresets = apiPresets.presets || [];
-    studio.models = [...result.models, ...(ollamaStatus.compatible_models || []), ...studio.apiProviderModels];
-    studio.externalModel = null;
-    studio.externalServerError = null;
+    const models = [...result.models, ...(ollamaStatus.compatible_models || []), ...studio.apiProviderModels];
+    let externalModel = null;
+    let externalServerError = null;
     if (studio.externalServerConfig) {
       try {
         const external = await probeExternalServer(studio.externalServerConfig);
-        studio.externalModel = external.model;
-        studio.models.push(external.model);
+        if (studio.modelDiscoveryAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision || (studio.externalConnectionAttempt || 0) !== externalAttempt) return;
+        externalModel = external.model;
+        models.push(external.model);
       } catch (error) {
-        studio.externalServerError = error;
+        if (studio.modelDiscoveryAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision || (studio.externalConnectionAttempt || 0) !== externalAttempt) return;
+        externalServerError = error;
       }
     }
+    const savedProjectors = projectorChoices();
+    for (let i = 0; i < models.length; i++) {
+      const model = models[i], path = savedProjectors[model.id];
+      if (!path || !model.projector_candidates?.includes(path)) continue;
+      try { models[i] = (await selectProjector(model.id, path)).model; }
+      catch { /* The current scan remains usable when a saved file disappears. */ }
+      if (studio.modelDiscoveryAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision || (studio.externalConnectionAttempt || 0) !== externalAttempt) return;
+    }
+    studio.ollamaStatus = ollamaStatus;
+    studio.ollamaError = ollamaStatus.error || null;
+    studio.apiProviderPresets = apiPresets.presets || [];
+    studio.models = models;
+    studio.externalModel = externalModel;
+    studio.externalServerError = externalServerError;
     studio.modelSetup = result.setup || [];
     studio.modelDiscovery = result.discovery || null;
     studio.modelDirectory = result.model_directory || "ComfyUI/models/LLM/";
     studio.gpuMemory = status.gpu_memory;
-    updatePromptResidency(status);
+    if (!studio.requestBusy) updatePromptResidency(status);
     const restoredModel = !selectedBeforeRefresh ? restoredModelAfterDiscovery(studio) : null;
     selectModel(
       restoredModel
@@ -2318,11 +2752,18 @@ async function refreshModels() {
       { preserveSettingsProvider: studio.root.classList.contains("is-settings-open") },
     );
     studio.preferencesRestoring = false;
-    setGenerationState("idle", "", "");
+    if (!studio.requestBusy) setGenerationState("idle", "", "");
     refreshGGUFRuntimeDiagnostics();
   } catch (error) {
+    if (studio.modelDiscoveryAttempt !== attempt || (studio.modelSelectionRevision || 0) !== selectionRevision) return;
     studio.preferencesRestoring = false;
     showToast(error.code || "Model scan failed", error.message, error.details);
+  } finally {
+    // A newer selection can invalidate the result, but must not leave startup
+    // restoration active. A newer discovery owns its own completion instead.
+    if (studio.modelDiscoveryAttempt === attempt) {
+      studio.preferencesRestoring = false;
+    }
   }
 }
 
@@ -2343,6 +2784,7 @@ async function configureOllamaHost(form) {
     studio.ollamaHostSettingsOpen = false;
     studio.ollamaStorageHelpOpen = false;
     saveOllamaHost(localStorage, endpoint);
+    form.elements.host.value = endpoint;
     studio.models = [...studio.models.filter((model) => model.family !== "ollama"), ...(status.compatible_models || [])];
     studio.promptResidency.ollama = [];
     const model = ollamaModelForSettings();
@@ -2419,7 +2861,7 @@ function toggleRefine(open) {
   if (open && studio.mode === "Music3") toggleLyricsRefine(false);
   panel.hidden = !open;
   outputPanel.classList.toggle("is-refining", open);
-  if (open) requestAnimationFrame(() => panel.querySelector("textarea").focus({ preventScroll: true }));
+  if (open) scheduleStudioFocus(() => panel.querySelector("textarea"));
 }
 
 function toggleLyricsRefine(open) {
@@ -2427,7 +2869,7 @@ function toggleLyricsRefine(open) {
   const panel = studio.root.querySelector("[data-lyrics-refine-panel]");
   if (open) toggleRefine(false);
   panel.hidden = !open;
-  if (open) requestAnimationFrame(() => panel.querySelector("textarea").focus({ preventScroll: true }));
+  if (open) scheduleStudioFocus(() => panel.querySelector("textarea"));
 }
 
 async function cancelLyricsRefinement() {
@@ -2470,22 +2912,25 @@ async function submitLyricsRefinement() {
     return;
   }
   if (!generationModeIsAvailable()) return;
-  if (!await inspectDirectRuntime()) return;
+  if (!await prepareWriterRequest()) return;
 
-  studio.activeRequestFamily = studio.selectedModel.family;
-  studio.activeRequestModelId = studio.selectedModel.family === "ollama" ? studio.selectedModel.remote_model : studio.selectedModel.id;
+  markActiveWriterRequest();
   studio.lyricsRequestBusy = true;
   submit.disabled = true;
   submit.innerHTML = `<span class="h3ps-spinner"></span>${currentLyrics.trim() ? "Refining…" : "Creating…"}`;
   setGenerationState("busy", currentLyrics.trim() ? "Refining lyrics" : "Creating lyrics", studio.selectedModel.name.split("/").pop());
   try {
-    const result = await refine(buildLyricsRefinePayload(studio, {
+    const result = await vramHandoffCoordinator.trackWriterRequest(refine(buildLyricsRefinePayload(studio, {
       currentLyrics,
       instruction,
       useMusicBrief,
       creativeBrief: musicBrief,
       seed: newGenerationSeed(),
-    }));
+    })));
+    if (lyrics.value !== currentLyrics) {
+      showToast("Lyrics kept", "The rewrite was not applied because you edited the Lyrics.");
+      return;
+    }
     studio.lyricsRestore = { lyrics: currentLyrics };
     lyrics.value = result.prompt;
     const restore = panel.querySelector("[data-lyrics-refine-restore]");
@@ -2493,11 +2938,13 @@ async function submitLyricsRefinement() {
     restore.hidden = false;
     updateMusicLyricsCount();
     saveCurrentModeDraft();
+    studio.desktopNotifications.notify("Lyrics request finished.");
     showToast(
       currentLyrics.trim() ? "Lyrics rewritten" : "Lyrics created",
       `${result.total_seconds.toFixed(1)}s · ${result.tokens_per_second.toFixed(1)} tok/s`,
     );
   } catch (error) {
+    if (error.code !== "GENERATION_CANCELLED") studio.desktopNotifications.notify("Lyrics request failed. Open Writer for details.");
     if (error.code === "GENERATION_CANCELLED") showToast("Lyrics request cancelled", "The previous Lyrics were kept.");
     else if (error.code === "INSUFFICIENT_FREE_VRAM") showVramRetry(error, submitLyricsRefinement);
     else showToast(error.code || "Lyrics request failed", error.message, error.details);
@@ -2509,8 +2956,7 @@ async function submitLyricsRefinement() {
       const status = await getStatus(studio.ollamaHost);
       updatePromptResidency(status);
     } catch {}
-    studio.activeRequestFamily = null;
-    studio.activeRequestModelId = null;
+    clearActiveWriterRequest();
     setGenerationState("idle", "", "");
   }
 }
@@ -2520,7 +2966,7 @@ async function submitRefinement() {
   const submit = panel.querySelector("[data-refine-submit]");
   const instruction = panel.querySelector("textarea").value.trim();
   const output = studio.root.querySelector("[data-output]");
-  if (submit.disabled) return;
+  if (submit.disabled || studio.requestBusy) return;
   if (!instruction) {
     showToast("Add a revision note", "Tell the model what should change in the current prompt.");
     return;
@@ -2534,23 +2980,26 @@ async function submitRefinement() {
     return;
   }
   if (!generationModeIsAvailable()) return;
-  if (!await inspectDirectRuntime()) return;
+  if (!await prepareWriterRequest()) return;
 
   const previousPrompt = output.value;
   const previousMeta = studio.root.querySelector(".h3ps-editor-meta span:last-child").textContent;
-  studio.activeRequestFamily = studio.selectedModel.family;
-  studio.activeRequestModelId = studio.selectedModel.family === "ollama" ? studio.selectedModel.remote_model : studio.selectedModel.id;
+  markActiveWriterRequest();
   submit.disabled = true;
   submit.innerHTML = `<span class="h3ps-spinner"></span>Refining…`;
   setGenerationState("busy", "Refining prompt", studio.selectedModel.name.split("/").pop());
   try {
-    const result = await refine(buildRefinePayload(studio, {
+    const result = await vramHandoffCoordinator.trackWriterRequest(refine(buildRefinePayload(studio, {
       currentPrompt: previousPrompt,
       instruction,
       creativeBrief: currentBriefTextarea().value.trim(),
       lyrics: studio.mode === "Music3" ? studio.root.querySelector("[data-music-lyrics]").value : "",
       seed: newGenerationSeed(),
-    }));
+    })));
+    if (output.value !== previousPrompt) {
+      showToast("Prompt kept", "The rewrite was not applied because you edited the prompt.");
+      return;
+    }
     studio.refineRestore = {
       prompt: previousPrompt,
       meta: previousMeta,
@@ -2560,13 +3009,16 @@ async function submitRefinement() {
     output.value = result.prompt;
     studio.lastModelPrompt = result.prompt;
     renderPromptHighlights();
-    panel.querySelector("textarea").value = "";
+    if (panel.querySelector("textarea").value.trim() === instruction) {
+      panel.querySelector("textarea").value = "";
+    }
     panel.querySelector("[data-refine-restore]").hidden = false;
     studio.lastModelMeta = formatGenerationMeta(result);
     syncRuntimeSummary(result);
     studio.root.querySelector(".h3ps-editor-meta span:last-child").textContent = studio.lastModelMeta;
     syncModifiedState();
     saveCurrentModeDraft();
+    studio.desktopNotifications.notify("Refinement finished. Your prompt is ready.");
     showToast(
       result.thinking_fallback ? "Rewrite completed" : "Prompt rewritten",
       result.thinking_fallback
@@ -2580,6 +3032,7 @@ async function submitRefinement() {
         : `${result.total_seconds.toFixed(1)}s · ${result.tokens_per_second.toFixed(1)} tok/s · no media re-upload`,
     );
   } catch (error) {
+    if (error.code !== "GENERATION_CANCELLED") studio.desktopNotifications.notify("Refinement failed. Open Writer for details.");
     if (error.code === "INSUFFICIENT_FREE_VRAM") showVramRetry(error, submitRefinement);
     else showToast(error.code || "Refinement failed", error.message, error.details);
   } finally {
@@ -2589,8 +3042,7 @@ async function submitRefinement() {
       const status = await getStatus(studio.ollamaHost);
       updatePromptResidency(status);
     } catch {}
-    studio.activeRequestFamily = null;
-    studio.activeRequestModelId = null;
+    clearActiveWriterRequest();
     setGenerationState("idle", "", "");
   }
 }
@@ -2619,7 +3071,66 @@ function syncFullscreenState() {
   button.innerHTML = icon(studio.fullscreen ? "collapse" : "expand", 17);
 }
 
+function syncTheme() {
+  if (!studio) return;
+  studio.root.dataset.theme = studio.theme;
+  studio.floatingMedia?.refresh();
+  const button = studio.root.querySelector("[data-theme-toggle]");
+  if (!button) return;
+  const light = studio.theme === "light";
+  button.innerHTML = icon(light ? "moon" : "sun", 17);
+  button.setAttribute("aria-label", light ? "Switch to dark theme" : "Switch to light theme");
+  button.title = light ? "Switch to dark theme" : "Switch to light theme";
+  button.setAttribute("aria-pressed", String(light));
+}
+
+function setTheme(theme) {
+  if (!studio) return;
+  studio.theme = theme === "light" ? "light" : "dark";
+  syncTheme();
+  saveUserPreferences(localStorage, studio);
+}
+
+function syncInterfaceSize() {
+  if (!studio) return;
+  const size = INTERFACE_SIZES.includes(studio.interfaceSize) ? studio.interfaceSize : "100";
+  const index = INTERFACE_SIZES.indexOf(size);
+  studio.interfaceSize = size;
+  studio.root.dataset.interfaceSize = size;
+  studio.floatingMedia?.refresh();
+  const slider = studio.root.querySelector("[data-interface-size-range]");
+  const output = studio.root.querySelector("[data-interface-size-value]");
+  const button = studio.root.querySelector("[data-interface-size-toggle]");
+  if (slider) {
+    slider.value = String(index);
+    slider.setAttribute("aria-valuetext", `${size}%`);
+    slider.style.setProperty("--h3ps-range", `${index / (INTERFACE_SIZES.length - 1) * 100}%`);
+  }
+  if (output) output.textContent = `${size}%`;
+  if (button) {
+    button.setAttribute("aria-label", `Interface size ${size}%`);
+    button.title = `Interface size ${size}%`;
+  }
+}
+
+function setInterfaceSize(size) {
+  if (!studio) return;
+  studio.interfaceSize = INTERFACE_SIZES.includes(String(size)) ? String(size) : "100";
+  syncInterfaceSize();
+  saveUserPreferences(localStorage, studio);
+}
+
+function setInterfaceSizeMenuOpen(open, restoreFocus = false) {
+  if (!studio) return;
+  const menu = studio.root.querySelector("[data-interface-size-menu]");
+  const button = studio.root.querySelector("[data-interface-size-toggle]");
+  menu.hidden = !open;
+  button.setAttribute("aria-expanded", String(open));
+  if (restoreFocus) button.focus();
+}
+
 function setFullscreen(fullscreen) {
+  if (!HOST_CAPABILITIES.windowed) fullscreen = true;
   if (!studio || studio.fullscreen === fullscreen) return;
   studio.fullscreen = fullscreen;
   syncFullscreenState();
@@ -2636,7 +3147,7 @@ function createStudio() {
   root.setAttribute("aria-hidden", "true");
   root.innerHTML = `
     <div class="h3ps-backdrop" data-close-studio></div>
-    <section class="h3ps-modal" role="dialog" aria-modal="true" aria-label="H3 Prompt Writer">
+    <section class="h3ps-modal" role="dialog" aria-label="H3 Prompt Writer" hidden>
       <header class="h3ps-header">
         <div class="h3ps-brand">
           <img class="h3ps-brandmark" src="${studioBrandIcon}" alt="H3 Prompt Writer">
@@ -2648,10 +3159,20 @@ function createStudio() {
         </nav>
         <div class="h3ps-header-meta">
           <div class="h3ps-guide-picker">
-            <button class="h3ps-guide-button" type="button" data-guide-toggle>Official guides ${icon("chevron", 13)}</button>
+            <button class="h3ps-guide-button" type="button" aria-expanded="false" data-guide-toggle>Official guides ${icon("chevron", 13)}</button>
             <div class="h3ps-guide-menu" data-guide-menu hidden><span>Loading guides…</span></div>
           </div>
           <button class="h3ps-guide-button" type="button" data-open-settings-header>Settings</button>
+          ${supportsWorkflowMedia() ? `<button class="h3ps-icon-button" type="button" data-open-floating-media title="Media panel" aria-label="Media panel">${icon("grid", 17)}</button>` : ""}
+          <button class="h3ps-icon-button" type="button" title="Switch to light theme" aria-label="Switch to light theme" aria-pressed="false" data-theme-toggle>${icon("sun", 17)}</button>
+          <div class="h3ps-interface-size-picker" data-interface-size-picker>
+            <button class="h3ps-icon-button h3ps-interface-size-button" type="button" title="Interface size 100%" aria-label="Interface size 100%" aria-haspopup="true" aria-expanded="false" data-interface-size-toggle>Aa</button>
+            <div class="h3ps-interface-size-menu" data-interface-size-menu hidden>
+              <header><strong>Interface Size</strong><output data-interface-size-value>100%</output></header>
+              <input type="range" min="0" max="3" step="1" value="0" aria-label="Interface size" data-interface-size-range>
+              <div class="h3ps-interface-size-marks" aria-hidden="true"><span>100%</span><span>110%</span><span>120%</span><span>125%</span></div>
+            </div>
+          </div>
           <button class="h3ps-icon-button" type="button" title="Enter fullscreen" aria-label="Enter fullscreen" aria-pressed="false" data-fullscreen-toggle>${icon("expand", 17)}</button>
           <button class="h3ps-icon-button" type="button" title="Close" data-close-studio>${icon("close", 18)}</button>
         </div>
@@ -2660,7 +3181,7 @@ function createStudio() {
       ${settingsMarkup(icon)}
 
       <div class="h3ps-workspace-toolbar" data-generate-view>
-        <nav class="h3ps-modes" aria-label="Generation mode" data-video-modes>
+        <nav class="h3ps-modes" role="tablist" aria-label="Generation mode" data-video-modes>
           ${Object.keys(MODES).map((mode) => `<button type="button" role="tab" data-mode="${mode}">${mode}</button>`).join("")}
         </nav>
         <div class="h3ps-output-toolbar">
@@ -2674,21 +3195,37 @@ function createStudio() {
           <div data-video-inputs>
           <div class="h3ps-section-heading">
             <span><small>Media</small><strong data-h3ps-mode-title></strong></span>
-            <button class="h3ps-quiet-button" type="button" data-clear-media>Clear</button>
+            <div class="h3ps-section-actions">
+              <div class="h3ps-clear-control" data-clear-control>
+                ${splitMenuMarkup(icon, {label: "Actions", primary: "data-actions-menu-toggle", toggle: "data-clear-menu-toggle", menu: "data-clear-menu", ariaLabel: "Media actions", contents: `
+                  ${supportsWorkflowMedia() ? `<button type="button" data-open-floating-media data-media-panel-action disabled title="Add media first"><strong>Media panel</strong><small>ADD TO WORKFLOW</small></button>` : ""}
+                  <button type="button" data-open-composer disabled><strong>Compose</strong><small>Create collage</small></button>
+                  <hr data-compose-separator>
+                  <button type="button" data-draft-save><strong>Save text draft</strong><small>Download JSON</small></button>
+                  <button type="button" data-draft-load><strong>Load text draft</strong><small>Open JSON</small></button>
+                  <input type="file" accept=".json,application/json" data-draft-file hidden>
+                  <hr>
+                  <button type="button" data-clear-action data-clear-media><strong>Clear media</strong><small>Keep prompts</small></button>
+                  <button type="button" data-clear-action data-clear-prompts><strong>Clear prompts</strong><small>Keep media</small></button>
+                  <button class="is-destructive" type="button" data-clear-action data-clear-all><strong>Clear all</strong><small>Media and prompts</small></button>
+                `})}
+              </div>
+            </div>
           </div>
           <p class="h3ps-section-hint" data-h3ps-mode-hint></p>
           <div class="h3ps-media" data-h3ps-media></div>
 
           <div class="h3ps-control-grid">
             <label class="h3ps-field h3ps-duration-field"><span>Duration <b data-duration-label>10 seconds</b></span><div><input type="range" min="1" max="20" step="1" value="10" style="--h3ps-range:47.37%" data-duration-slider><i></i></div></label>
-            <label class="h3ps-field h3ps-choice"><span>Aspect ratio</span><button type="button" data-choice-toggle="aspect"><b data-aspect-label>16:9</b><em data-aspect-description>Widescreen</em>${icon("chevron", 13)}</button><div class="h3ps-choice-menu h3ps-aspect-menu" data-choice-menu="aspect" hidden>${ASPECT_RATIOS.map(([value, label]) => `<button type="button" data-aspect="${value}"><b>${value}</b><em>${label}</em></button>`).join("")}</div></label>
+            ${aspectRatioMarkup(icon)}
           </div>
 
           <label class="h3ps-brief">
             <span><strong>Creative brief</strong><small>Describe what should happen in the video</small></span>
-            <textarea spellcheck="true" maxlength="8000" data-video-brief>Use identity and wardrobe from Picture 1 and the slow lateral camera movement from Video 1. A solitary character waits at a rain-soaked tram stop at blue hour, notices an approaching light and turns into the wind. End on a quiet, unresolved look; keep the shot cinematic, realistic and restrained.</textarea>
-            <small class="h3ps-char-count">0 / 8,000</small>
+            <textarea spellcheck="true" data-video-brief>Use identity and wardrobe from Picture 1 and the slow lateral camera movement from Video 1. A solitary character waits at a rain-soaked tram stop at blue hour, notices an approaching light and turns into the wind. End on a quiet, unresolved look; keep the shot cinematic, realistic and restrained.</textarea>
+            <small class="h3ps-char-count">0 characters</small>
           </label>
+
           </div>
 
           <div class="h3ps-music-inputs" data-music-inputs hidden>
@@ -2745,10 +3282,11 @@ function createStudio() {
           ${generateModelSummaryMarkup(icon)}
         </section>
 
-        <section class="h3ps-output-panel">
+        <section class="h3ps-output-panel" aria-label="Generated result">
+          <div class="h3ps-output-mobile-toolbar" aria-hidden="true"><span data-output-mobile-label>Generated prompt</span></div>
           <div class="h3ps-editor-wrap">
             <div class="h3ps-editor-highlight" data-prompt-highlights aria-hidden="true"></div>
-            <textarea class="h3ps-editor" spellcheck="false" data-output>${SAMPLE_PROMPT}</textarea>
+            <textarea class="h3ps-editor" aria-label="Generated prompt" spellcheck="false" data-output>${SAMPLE_PROMPT}</textarea>
             <div class="h3ps-reference-peek" data-reference-peek hidden></div>
             <div class="h3ps-editor-meta"><span>${promptLengthMeta(SAMPLE_PROMPT)}</span></div>
           </div>
@@ -2766,12 +3304,8 @@ function createStudio() {
           <div class="h3ps-output-actions">
             <span class="h3ps-output-primary-actions">
               <button class="h3ps-secondary-button" type="button" title="Refine with local LLM" data-refine-toggle>${icon("spark", 15)} Refine</button>
-              <span class="h3ps-reference-insert" data-reference-insert hidden>
-                <button class="h3ps-reference-insert-toggle" type="button" title="Insert reference" aria-label="Insert reference" aria-haspopup="menu" aria-expanded="false" data-reference-insert-toggle></button>
-                <span class="h3ps-reference-insert-popover" data-reference-insert-popover role="menu" hidden></span>
-              </span>
             </span>
-            <button class="h3ps-secondary-button" type="button" data-copy>${icon("copy", 15)} <span data-copy-label>Copy prompt</span></button>
+            ${copyButtonMarkup(icon, "data-copy", '<span data-copy-label>Copy prompt</span>')}
           </div>
         </section>
       </div>
@@ -2781,76 +3315,122 @@ function createStudio() {
           <button class="h3ps-memory-action" type="button" data-comfy-memory-action title="Unload models held by ComfyUI without clearing cached workflow results">${icon("memory", 15)}Free ComfyUI VRAM</button>
           <span class="h3ps-prompt-lifecycle-actions" data-prompt-lifecycle-actions></span>
         </div>
-        <div class="h3ps-status is-busy" data-status hidden><span><strong></strong><small data-status-detail></small></span></div>
+        <div class="h3ps-status is-busy" role="status" aria-live="polite" aria-atomic="true" data-status hidden><span><strong></strong><small data-status-detail></small></span></div>
         <div class="h3ps-footer-actions">
           <span class="h3ps-generation-options">
             <label class="h3ps-toggle-control"><input type="checkbox" data-thinking><span></span>Thinking</label>
             <label class="h3ps-toggle-control" data-keep-loaded-control title="Keep the prompt model in VRAM for the next prompt"><input type="checkbox" data-keep-loaded><span></span>Keep model loaded</label>
+            ${autoVramControlMarkup(VRAM_HANDOFF_SUPPORTED)}
           </span>
           <button class="h3ps-primary-button" type="button" data-generate>${icon("spark", 16)}<span data-generate-label>Generate prompt</span></button>
         </div>
       </footer>
     </section>
 
-    <section class="h3ps-other-models-popover" data-other-models-popover hidden>
-      <header><span><strong>Other verified models</strong><small>Recommended GGUF and projector pairs</small></span><button class="h3ps-icon-button" type="button" data-other-models-close>${icon("close", 16)}</button></header>
+    <div class="h3ps-other-models-backdrop" aria-hidden="true" data-other-models-backdrop hidden></div>
+    <section class="h3ps-other-models-popover" role="dialog" aria-label="Other verified models" data-other-models-popover hidden>
+      <header><span><strong>Other verified models</strong><small>Recommended GGUF and projector pairs</small></span><button class="h3ps-icon-button" type="button" aria-label="Close verified models" data-other-models-close>${icon("close", 16)}</button></header>
       <div class="h3ps-other-models-catalog" data-other-models-catalog></div>
     </section>
 
-    <section class="h3ps-video-preview" data-h3ps-preview aria-hidden="true">
-      <div class="h3ps-preview-backdrop" data-close-preview></div>
-      <div class="h3ps-preview-dialog">
-        <header><span><small>Video reference</small><strong data-preview-name>camera_motion.mp4</strong></span><button class="h3ps-icon-button" type="button" data-close-preview>${icon("close", 18)}</button></header>
-        <div class="h3ps-video-stage"><video controls preload="metadata" data-preview-video></video></div>
-        <div class="h3ps-sample-heading"><span><small>What the model sees</small><strong>Contact sheet</strong></span><div class="h3ps-sample-controls"><div class="h3ps-frame-count"><span>Frames</span><button type="button" data-frame-count="auto">Auto</button><button type="button" data-frame-count="4">4</button><button type="button" data-frame-count="6">6</button><button type="button" data-frame-count="8">8</button></div><label class="h3ps-endpoints"><input type="checkbox" data-include-endpoints checked>First & last</label><button type="button" data-resample>${icon("refresh", 14)} Resample</button></div></div>
-        <div class="h3ps-contact-sheet"><img data-preview-sheet alt="Contact sheet sent to the local model"><span class="h3ps-sheet-updating"><i class="h3ps-spinner"></i>Updating…</span></div>
-        <footer><span>${icon("check", 13)} Use for local analysis</span><small data-preview-sampling></small></footer>
-      </div>
-    </section>
-
-    <section class="h3ps-image-preview" data-h3ps-image-preview aria-hidden="true">
-      <div class="h3ps-preview-backdrop" data-close-image-preview></div>
-      <div class="h3ps-image-preview-dialog">
-        <header><span><small data-image-preview-reference>Picture reference</small><strong data-image-preview-name></strong></span><button class="h3ps-icon-button" type="button" data-close-image-preview>${icon("close", 18)}</button></header>
-        <div class="h3ps-image-preview-stage"><img data-image-preview-image alt=""></div>
-      </div>
-    </section>
-
-    <div class="h3ps-toast" data-h3ps-toast><span class="h3ps-toast-icon">${icon("info", 17)}</span><span><strong data-toast-title>Notice</strong><span data-toast-message></span><button type="button" class="h3ps-toast-action" data-toast-action hidden></button><details data-toast-details hidden><summary>Technical details</summary><pre></pre></details></span></div>`;
+    <div class="h3ps-toast" role="status" aria-live="polite" aria-atomic="true" data-h3ps-toast><span class="h3ps-toast-icon">${icon("info", 17)}</span><span><strong data-toast-title>Notice</strong><span data-toast-message></span><button type="button" class="h3ps-toast-action" data-toast-action hidden></button><details data-toast-details hidden><summary>Technical details</summary><pre></pre></details></span></div>`;
   document.body.appendChild(root);
 
   studio = { root, ...createStudioState({ sessionId: createSessionId(), storage: localStorage }) };
+  root.querySelector("[data-comfy-memory-action]").hidden = !HOST_CAPABILITIES.comfyMemory;
+  if (!HOST_CAPABILITIES.windowed) {
+    studio.fullscreen = true;
+    root.querySelectorAll("[data-close-studio], [data-fullscreen-toggle]").forEach(control => { control.hidden = true; });
+  }
+  const onMediaToolOpenChange = (open) => {
+    const modal = root.querySelector(".h3ps-modal");
+    modal.inert = open;
+    if (open) modal.removeAttribute("aria-modal");
+    else if (root.classList.contains("is-open")) modal.setAttribute("aria-modal", "true");
+  };
+  const mediaToolUnavailable = (message) => showToast("Media tool unavailable", message);
+  studio.mediaComposer = createLazyMediaTool(root, async () => {
+    const { createMediaComposer } = await import("./media_composer.js");
+    return createMediaComposer({
+      root,
+      icon,
+      onAddPicture: addComposedPicture,
+      getAddState: composerAddState,
+      notify: (kind, message) => showToast(kind === "error" ? "Composer failed" : "Media Composer", message),
+      onOpenChange: onMediaToolOpenChange,
+    });
+  }, mediaToolUnavailable);
+  studio.mediaEditor = createLazyMediaTool(root, async () => {
+    const { createMediaEditor } = await import("./media_editor.js");
+    return createMediaEditor({
+      root,
+      icon,
+      onAddFrame: async (blob, filename) => {
+        const file = new File([blob], filename, { type: "image/png" });
+        const result = await uploadMedia(studio.sessionId, "Reference", [file]);
+        studio.assets.push(...result.assets);
+        showToast("Picture added", result.assets[0].reference);
+        renderMedia(studio.mode);
+      },
+      onAddAudio: async (blob, filename) => {
+        const result = await uploadMedia(studio.sessionId, "Reference", [new File([blob], filename, { type: "audio/wav" })]);
+        studio.assets.push(...result.assets);
+        showToast("Audio added", `${result.assets[0].reference}. Connect the downloaded WAV separately in H3. Writer does not analyze sound; describe its role in the Brief.`);
+        renderMedia(studio.mode);
+      },
+      request: (assetId, options) => editMedia(studio.sessionId, assetId, options),
+      onSaved: (result) => {
+        showToast("Media applied", "Crop and trim applied. The original source is preserved.");
+        acceptMediaAssets(result.assets);
+        renderMedia(studio.mode);
+      },
+      notify: (message) => showToast("Media Editor", message),
+      onOpenChange: onMediaToolOpenChange,
+    });
+  }, mediaToolUnavailable);
   root.querySelector("[data-lyrics-use-brief]").checked = studio.musicLyricsUseBrief;
   const durationSlider = root.querySelector("[data-duration-slider]");
   durationSlider.value = String(studio.durationSeconds);
   durationSlider.style.setProperty("--h3ps-range", `${(studio.durationSeconds - 1) / 19 * 100}%`);
   root.querySelector("[data-duration-label]").textContent = `${studio.durationSeconds} seconds`;
-  const restoredAspect = ASPECT_RATIOS.find(([value]) => value === studio.aspectRatio) || ASPECT_RATIOS.find(([value]) => value === "16:9");
-  root.querySelector("[data-aspect-label]").textContent = restoredAspect[0];
-  root.querySelector("[data-aspect-description]").textContent = restoredAspect[1];
+  studio.aspectControl = bindAspectRatio(root.querySelector('[data-choice-toggle="aspect"]').closest(".h3ps-choice"), studio.aspectRatio, value => {
+    studio.aspectRatio = value;
+    saveUserPreferences(localStorage, studio);
+  });
+  syncTheme();
+  syncInterfaceSize();
   syncFullscreenState();
   root.querySelectorAll("[data-close-studio]").forEach((el) => el.addEventListener("click", closeStudio));
   root.querySelector("[data-fullscreen-toggle]").addEventListener("click", () => setFullscreen(!studio.fullscreen));
+  root.querySelector("[data-theme-toggle]").addEventListener("click", () => setTheme(studio.theme === "light" ? "dark" : "light"));
+  root.querySelectorAll("[data-open-floating-media]").forEach(button => button.addEventListener("click", openFloatingMedia));
+  root.querySelector("[data-open-composer]").addEventListener("click", (event) => openMediaComposer(event.currentTarget));
+  root.querySelector("[data-interface-size-toggle]").addEventListener("click", () => {
+    const menu = root.querySelector("[data-interface-size-menu]");
+    setInterfaceSizeMenuOpen(menu.hidden);
+  });
+  root.querySelector("[data-interface-size-range]").addEventListener("input", (event) => {
+    setInterfaceSize(INTERFACE_SIZES[Number(event.target.value)] || "100");
+  });
   root.addEventListener("click", (event) => {
     if (studio.draftDefaultsArmed && !event.target.closest("[data-restore-default-drafts]")) disarmDraftDefaults();
     if (studio.toastDismissOnWorkspaceClick && !event.target.closest("[data-h3ps-toast]")) hideToast();
     if (!event.target.closest("[data-other-models-toggle], [data-other-models-popover]")) setOtherModelsPopover(false);
-    if (!isRuntimeMenuInteraction(event.target)) {
-      root.querySelectorAll("[data-runtime-menu]").forEach((menu) => { menu.hidden = true; });
-    }
+    if (!isRuntimeMenuInteraction(event.target)) closeRuntimeMenus();
     if (!isChoiceMenuInteraction(event.target)) {
       root.querySelectorAll("[data-choice-menu]").forEach((menu) => { menu.hidden = true; });
+      root.querySelectorAll("[data-choice-toggle]").forEach((button) => button.setAttribute("aria-expanded", "false"));
     }
     if (!isGuideMenuInteraction(event.target)) {
       root.querySelectorAll("[data-guide-menu]").forEach((menu) => { menu.hidden = true; });
+      root.querySelector("[data-guide-toggle]")?.setAttribute("aria-expanded", "false");
     }
+    if (!event.target.closest("[data-interface-size-picker]")) setInterfaceSizeMenuOpen(false);
     if (!event.target.closest("[data-model-files-toggle], [data-model-files-menu]")) {
       root.querySelectorAll("[data-model-files-menu]").forEach((menu) => { menu.hidden = true; });
     }
-    if (!event.target.closest("[data-reference-insert]")) closeReferenceInsert();
+    if (!event.target.closest("[data-clear-control]")) setClearMenuOpen(false);
   });
-  root.querySelectorAll("[data-close-preview]").forEach((el) => el.addEventListener("click", closeVideoPreview));
-  root.querySelectorAll("[data-close-image-preview]").forEach((el) => el.addEventListener("click", closeImagePreview));
   root.querySelectorAll("[data-workspace]").forEach((button) => button.addEventListener("click", () => {
     const nextMode = button.dataset.workspace === "music" ? "Music3" : studio.lastVideoMode;
     if (!isGenerationModeAvailable(studio.selectedModel, nextMode)) return;
@@ -2879,23 +3459,68 @@ function createStudio() {
   root.querySelector("[data-open-settings-header]").addEventListener("click", () => setSettingsOpen(true));
   root.querySelector("[data-open-settings]").addEventListener("click", () => setSettingsOpen(true));
   root.querySelector("[data-close-settings]").addEventListener("click", () => setSettingsOpen(false));
-  root.querySelector("[data-clear-media]").addEventListener("click", async () => {
-    try {
-      const result = await clearMedia(studio.sessionId, studio.mode);
-      studio.assets = result.assets;
-      closeVideoPreview();
-      renderMedia(studio.mode);
-      showToast("Media cleared", "The temporary session files were removed.");
-    } catch (error) {
-      showToast(error.code || "Clear failed", error.message, error.details);
-    }
+  root.querySelector("[data-clear-media]").addEventListener("click", () => {
+    setClearMenuOpen(false);
+    clearCurrentMedia();
+  });
+  root.querySelectorAll("[data-clear-menu-toggle], [data-actions-menu-toggle]").forEach(toggle => toggle.addEventListener("click", () => {
+    const menu = root.querySelector("[data-clear-menu]");
+    setClearMenuOpen(menu.hidden);
+  }));
+  root.querySelector("[data-clear-prompts]").addEventListener("click", () => {
+    setClearMenuOpen(false);
+    clearCurrentPrompts();
+  });
+  root.querySelector("[data-clear-all]").addEventListener("click", () => {
+    setClearMenuOpen(false);
+    clearEverything();
   });
   root.querySelector("[data-generate]").addEventListener("click", startGenerationPreview);
+  studio.desktopNotifications = createDesktopNotifications({ storage: localStorage, document, window });
+  const notificationsToggle = root.querySelector("[data-desktop-notifications]");
+  const syncNotifications = () => {
+    notificationsToggle.checked = studio.desktopNotifications.enabled;
+    root.querySelector("[data-desktop-notifications-hint]").title = studio.desktopNotifications.hint;
+  };
+  notificationsToggle.addEventListener("change", async () => {
+    notificationsToggle.disabled = true;
+    try { await studio.desktopNotifications.setEnabled(notificationsToggle.checked); }
+    finally { notificationsToggle.disabled = false; syncNotifications(); }
+  });
+  syncNotifications();
+  const hideLauncherToggle = root.querySelector("[data-hide-launcher]");
+  root.querySelector("[data-launcher-settings]").hidden = !HOST_CAPABILITIES.windowed;
+  syncLauncherVisibility();
+  hideLauncherToggle.addEventListener("change", async () => {
+    hideLauncherToggle.disabled = true;
+    try {
+      await app.extensionManager.setting.set(HIDE_LAUNCHER_SETTING, hideLauncherToggle.checked);
+    } catch (error) {
+      showToast("Setting not saved", error.message);
+    } finally {
+      hideLauncherToggle.disabled = false;
+      syncLauncherVisibility();
+    }
+  });
+  root.querySelector("[data-draft-save]").onclick=()=>{ setClearMenuOpen(false); saveTextDraft(); };
+  const draftInput=root.querySelector("[data-draft-file]");
+  root.querySelector("[data-draft-load]").onclick=()=>{ if(!studio.requestBusy) { setClearMenuOpen(false); draftInput.click(); } };
+  draftInput.onchange=async()=>{
+    const file=draftInput.files[0]; draftInput.value="";
+    if(!file || studio.requestBusy) return;
+    try {
+      if(file.size>2_000_000) throw Error("Draft file is too large (maximum 2 MB).");
+      const value=parseDraft(await file.text());
+      showToast("Load text draft?", "This replaces the target draft and clears its current media. Files are not included; reattach the original references after loading.",
+        value.media.length ? {references:value.media} : null, {label:"Load draft",onClick:()=>loadTextDraft(value)});
+    } catch(error) { showToast("Load draft",error.message); }
+  };
   root.querySelector("[data-restore-default-drafts]").addEventListener("click", restoreDefaultDrafts);
   root.querySelector("[data-comfy-memory-action]").addEventListener("click", () => releaseComfyVram());
   root.querySelector("[data-guide-toggle]").addEventListener("click", async () => {
     const menu = root.querySelector("[data-guide-menu]");
     menu.hidden = !menu.hidden;
+    root.querySelector("[data-guide-toggle]").setAttribute("aria-expanded", String(!menu.hidden));
     if (menu.hidden) return;
     if (studio.mode === "Music3") {
       menu.innerHTML = `<a href="${MUSIC3_GUIDE_URL}" target="_blank" rel="noopener noreferrer"><strong>Music Caption Rewriter</strong><small>Official MiniMax Music 3 guide</small></a>`;
@@ -2911,11 +3536,7 @@ function createStudio() {
       showToast(error.code || "Guide unavailable", error.message, error.details);
     }
   });
-  root.querySelectorAll("[data-choice-toggle]").forEach((button) => button.addEventListener("click", () => {
-    const menu = root.querySelector(`[data-choice-menu="${button.dataset.choiceToggle}"]`);
-    root.querySelectorAll("[data-choice-menu]").forEach((item) => { if (item !== menu) item.hidden = true; });
-    menu.hidden = !menu.hidden;
-  }));
+
   root.querySelector("[data-duration-slider]").addEventListener("input", (event) => {
     studio.durationSeconds = Number(event.target.value);
     root.querySelector("[data-duration-label]").textContent = `${studio.durationSeconds} seconds`;
@@ -2924,9 +3545,11 @@ function createStudio() {
   });
   root.querySelectorAll("[data-runtime-toggle]").forEach((button) => button.addEventListener("click", (event) => {
     event.preventDefault();
-    const menu = root.querySelector(`[data-runtime-menu="${button.dataset.runtimeToggle}"]`);
-    root.querySelectorAll("[data-runtime-menu]").forEach((item) => { if (item !== menu) item.hidden = true; });
-    menu.hidden = !menu.hidden;
+    const name = button.dataset.runtimeToggle;
+    const menu = root.querySelector(`[data-runtime-menu="${name}"]`);
+    const open = menu.hidden;
+    closeRuntimeMenus();
+    setRuntimeMenuOpen(name, open);
   }));
   root.querySelectorAll("[data-runtime-option]").forEach((button) => button.addEventListener("click", (event) => applyRuntimeOption(button, event)));
   root.querySelector("[data-custom-context-input]").addEventListener("input", (event) => {
@@ -2935,6 +3558,17 @@ function createStudio() {
     syncRuntimeSummary();
     syncThinkingAvailability();
     rememberRuntimePreferences();
+    saveUserPreferences(localStorage, studio);
+  });
+  root.querySelector("[data-ollama-context-input]").addEventListener("change", ({ target }) => {
+    if (!target.reportValidity()) {
+      showToast("Ollama context", target.validationMessage);
+      target.value = studio.ollamaContextTokens ?? "";
+      return;
+    }
+    studio.ollamaContextTokens = target.value === "" ? null : target.valueAsNumber;
+    syncThinkingAvailability();
+    syncRuntimeSummary();
     saveUserPreferences(localStorage, studio);
   });
   root.querySelector("[data-custom-generation-budget-input]").addEventListener("input", (event) => {
@@ -2996,6 +3630,10 @@ function createStudio() {
   root.querySelector("[data-keep-loaded]").addEventListener("change", (event) => {
     studio.keepModelLoaded = event.target.checked;
   });
+  root.querySelector("[data-vram-handoff]")?.addEventListener("change", (event) => {
+    studio.vramHandoff = event.target.checked;
+    saveUserPreferences(localStorage, studio);
+  });
   const updateBriefCount = () => {
     updateBriefLayout();
     saveCurrentModeDraft();
@@ -3009,14 +3647,7 @@ function createStudio() {
     studio.musicLyricsUseBrief = event.target.checked;
     saveUserPreferences(localStorage, studio);
   });
-  root.querySelectorAll("[data-aspect]").forEach((button) => button.addEventListener("click", () => {
-    studio.aspectRatio = button.dataset.aspect;
-    const option = ASPECT_RATIOS.find(([value]) => value === studio.aspectRatio);
-    root.querySelector("[data-aspect-label]").textContent = option[0];
-    root.querySelector("[data-aspect-description]").textContent = option[1];
-    root.querySelector('[data-choice-menu="aspect"]').hidden = true;
-    saveUserPreferences(localStorage, studio);
-  }));
+
   root.querySelectorAll("[data-provider-option]").forEach((button) => button.addEventListener("click", () => {
     selectSettingsProvider(button.dataset.providerOption);
   }));
@@ -3045,6 +3676,11 @@ function createStudio() {
       return;
     }
     const apiDisconnect = event.target.closest("[data-api-disconnect]");
+    const samplingReset = event.target.closest("[data-api-sampling-reset]");
+    if (samplingReset) {
+      saveApiSampling(samplingReset.closest("form"), true);
+      return;
+    }
     if (apiDisconnect) {
       disconnectConfiguredApiProvider();
       return;
@@ -3118,6 +3754,12 @@ function createStudio() {
     }
   });
   root.querySelector("[data-provider-detail]").addEventListener("submit", (event) => {
+    const samplingForm = event.target.closest("[data-api-sampling-form]");
+    if (samplingForm) {
+      event.preventDefault();
+      saveApiSampling(samplingForm);
+      return;
+    }
     const ollamaHostForm = event.target.closest("[data-ollama-host-form]");
     if (ollamaHostForm) {
       event.preventDefault();
@@ -3147,7 +3789,6 @@ function createStudio() {
   root.querySelector("[data-settings-view]").addEventListener("scroll", () => setOtherModelsPopover(false));
   window.addEventListener("resize", () => {
     updateBriefCount();
-    if (!root.querySelector("[data-other-models-popover]").hidden) positionOtherModelsPopover();
   });
   root.querySelector("[data-refine-toggle]").addEventListener("click", () => toggleRefine(root.querySelector("[data-refine-panel]").hidden));
   root.querySelector("[data-refine-cancel]").addEventListener("click", () => toggleRefine(false));
@@ -3170,13 +3811,6 @@ function createStudio() {
       previousLyrics.trim() ? "Previous Lyrics restored" : "Generated Lyrics removed",
       "The AI Lyrics change was discarded.",
     );
-  });
-  root.querySelector("[data-reference-insert-toggle]").addEventListener("pointerdown", (event) => event.preventDefault());
-  root.querySelector("[data-reference-insert-toggle]").addEventListener("click", toggleReferenceInsert);
-  root.querySelector("[data-reference-insert-popover]").addEventListener("pointerdown", (event) => event.preventDefault());
-  root.querySelector("[data-reference-insert-popover]").addEventListener("click", (event) => {
-    const option = event.target.closest("[data-insert-reference]");
-    if (option) insertSelectedReference(option.dataset.insertReference);
   });
   root.querySelector("[data-refine-restore]").addEventListener("click", () => {
     if (studio.refineRestore == null) return;
@@ -3202,23 +3836,17 @@ function createStudio() {
     saveCurrentModeDraft();
     showToast("Edits undone", "Restored the latest AI-generated prompt.");
   });
-  root.querySelector("[data-copy]").addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(root.querySelector("[data-output]").value);
-      showToast(studio.mode === "Music3" ? "Caption copied" : "Prompt copied", studio.mode === "Music3" ? "The generated Music 3 caption is on your clipboard." : "The generated H3 prompt is on your clipboard.");
-    } catch (error) {
-      showToast("Copy failed", "Clipboard access was denied.", error.message);
-    }
-  });
+  root.querySelector("[data-copy]").addEventListener("click", () => copyPromptText(root.querySelector("[data-output]").value, studio.mode === "Music3"));
   root.querySelector("[data-output]").addEventListener("input", () => {
     syncModifiedState();
     renderPromptHighlights();
     syncOutputLengthMeta();
     saveCurrentModeDraft();
-    syncReferenceInsertControl();
+
   });
   root.querySelector("[data-output]").addEventListener("scroll", renderPromptHighlights);
   const editor = root.querySelector("[data-output]");
+  new ResizeObserver(renderPromptHighlights).observe(editor);
   const supportedReferenceEditors = root.querySelectorAll("[data-video-brief], [data-output], [data-refine-instruction]");
   supportedReferenceEditors.forEach((field) => {
     ["focus", "click", "keyup", "select", "input"].forEach((type) => field.addEventListener(type, () => rememberReferenceInsertTarget(field)));
@@ -3250,14 +3878,29 @@ function createStudio() {
     if (event.target.closest("[data-prompt-reference]")) peek.hidden = true;
   });
   root.querySelector("[data-prompt-highlights]").addEventListener("click", () => editor.focus());
-  root.querySelector("[data-resample]").addEventListener("click", () => resampleCurrentVideo());
-  root.querySelectorAll("[data-frame-count]").forEach((button) => button.addEventListener("click", () => {
-    const asset = studio.assets.find((item) => item.id === studio.previewAssetId);
-    if (!asset || button.dataset.frameCount === (asset.frame_count_mode || "auto")) return;
-    resampleCurrentVideo({ frame_count: button.dataset.frameCount });
-  }));
-  root.querySelector("[data-include-endpoints]").addEventListener("change", (event) => {
-    resampleCurrentVideo({ include_endpoints: event.target.checked });
+  studio.sequence = createSequenceWorkspace({
+    root, icon, storage: localStorage, assets: () => studio.assets,
+    isBusy: () => studio.requestBusy,
+    snapshot: () => {
+      if (!studio.selectedModel?.runtime_ready) throw new Error("Select a ready prompt model in Settings.");
+      studio.modelSelectionRevision = (studio.modelSelectionRevision || 0) + 1;
+      return buildGeneratePayload(studio, { creativeBrief: "", seed: newGenerationSeed() });
+    },
+    prepare: prepareWriterRequest,
+    run: (payload, onEvent) => vramHandoffCoordinator.trackWriterRequest(generateSequence(payload, onEvent)),
+    cancel: (operationId) => cancelSequence(operationId, studio.sessionId),
+    busy: (busy) => {
+      if (busy) markActiveWriterRequest(); else clearActiveWriterRequest();
+      setGenerationState(busy ? "busy" : "idle", "Generating sequence", "Completed prompts are kept as each chunk finishes");
+      root.querySelector(".h3ps-generation-options").inert = busy;
+      root.querySelector("[data-settings-view]").inert = busy;
+    },
+    refresh: () => { syncWorkspace(); renderMedia(studio.mode); },
+    clearMedia: () => clearCurrentMedia(),
+    settled: (status) => studio.desktopNotifications.notify(status === "complete" ? "Sequence generation finished." : "Sequence needs attention. Open Writer for details."),
+    error: (error) => showToast("Sequence", error.message, error.details || null, null, sequenceNotificationOptions(error)),
+    copy: (text) => copyPromptText(text),
+    insert: (editor, reference) => insertReferenceAtCaret(editor, reference, editor.selectionStart),
   });
   syncWorkspace();
   restoreModeDraft(studio.mode);
@@ -3269,34 +3912,143 @@ function createStudio() {
   return studio;
 }
 
-function openStudio() {
+function supportsWorkflowMedia() {
+  return HOST_CAPABILITIES.workflowMedia && !!(app.canvas?.graph && window.LiteGraph?.createNode && app.clientPosToCanvasPos);
+}
+
+async function openFloatingMedia() {
   const current = createStudio();
+  const hasMedia = () => current.assets.some(asset => ["image", "video", "audio"].includes(asset.type) && asset.content_url);
+  if (!hasMedia()) { openStudio(); showToast("Add media first", ""); return; }
+  if (!supportsWorkflowMedia()) { openStudio(); showToast("Workflow canvas unavailable", ""); return; }
+  const request = ++mediaPanelRequest;
+  try {
+    if (!current.floatingMedia) {
+      current.floatingMediaPending ||= Promise.all([
+        import("./floating_media.js"), import("./workflow_media.js"), import("/scripts/api.js"),
+      ]).then(([{ createFloatingMediaPanel }, { createWorkflowMediaTransfer, createMediaMaterializer, workflowMediaSnapshot }, { api }]) => {
+        current.floatingMedia = createFloatingMediaPanel({
+          app, getState: () => current, icon, openWriter: openStudio,
+          transfer: createWorkflowMediaTransfer({ app, liteGraph: window.LiteGraph,
+            getWorkflowRevision: () => workflowRevision,
+            isCurrentMedia: snapshot => workflowMediaSnapshot(current.assets.find(asset => asset.id === snapshot.id))?.url === snapshot.url,
+            materialize: createMediaMaterializer((...args) => api.fetchApi(...args)) }),
+        });
+      }).finally(() => { current.floatingMediaPending = null; });
+      await current.floatingMediaPending;
+    }
+    if (request !== mediaPanelRequest) return;
+    if (!hasMedia()) { openStudio(); showToast("Add media first", ""); return; }
+    if (closeStudio() === false) return;
+    current.floatingMedia.open();
+  } catch (error) { showToast("Media panel unavailable", error.message); }
+}
+
+function focusAvailableControl(element) {
+  if (
+    !element?.isConnected ||
+    element.disabled ||
+    element.closest('[hidden], [inert], [aria-hidden="true"]') ||
+    !element.getClientRects().length
+  ) return false;
+  element.focus({ preventScroll: true });
+  return document.activeElement === element;
+}
+
+function scheduleStudioFocus(target) {
+  const current = studio;
+  const epoch = studioFocusEpoch;
+  requestAnimationFrame(() => {
+    if (
+      studio !== current ||
+      epoch !== studioFocusEpoch ||
+      !current.root.classList.contains("is-open")
+    ) return;
+    focusAvailableControl(target());
+  });
+}
+
+function openStudio() {
+  mediaPanelRequest++;
+  const current = createStudio();
+  if (current.root.classList.contains("is-open")) return;
+  studioFocusEpoch++;
+  current.floatingMedia?.suspend(true);
+  const modal = current.root.querySelector(".h3ps-modal");
+  const opener = document.activeElement;
+  studioReturnFocus = opener instanceof HTMLElement && !current.root.contains(opener) ? opener : null;
   setMusicSystemPromptExpanded(false);
   syncMusicSystemPromptSummary();
+  modal.hidden = false;
+  modal.inert = false;
+  modal.setAttribute("aria-modal", "true");
   current.root.classList.add("is-open");
   current.root.setAttribute("aria-hidden", "false");
   document.body.classList.add("h3ps-modal-open");
-  requestAnimationFrame(updateBriefLayout);
+  modal.tabIndex = -1;
+  updateBriefLayout();
+  scheduleStudioFocus(() => modal.querySelector("button[data-close-studio]:not([hidden])") || modal);
 }
 
 function closeStudio() {
-  if (!studio) return;
+  if (!HOST_CAPABILITIES.windowed) return false;
+  mediaPanelRequest++;
+  if (!studio?.root.classList.contains("is-open")) return;
+  const modal = studio.root.querySelector(".h3ps-modal");
+  if (studio.mediaEditor?.close() === false) return false;
+  if (studio.mediaComposer?.close() === false) return false;
+  studio.sequence?.leave();
+  studioFocusEpoch++;
   setSettingsOpen(false);
   setOtherModelsPopover(false);
-  closeVideoPreview();
-  closeImagePreview();
+
+  modal.removeAttribute("aria-modal");
+  modal.hidden = true;
+  modal.inert = true;
   studio.root.classList.remove("is-open");
   studio.root.setAttribute("aria-hidden", "true");
   document.body.classList.remove("h3ps-modal-open");
+  studio.floatingMedia?.suspend(false);
+  if (studio.root.contains(document.activeElement)) document.activeElement.blur();
+  if (!focusAvailableControl(studioReturnFocus)) focusAvailableControl(app.canvas?.canvas);
+  studioReturnFocus = null;
+}
+
+function syncLauncherVisibility(hidden = app.extensionManager?.setting?.get(HIDE_LAUNCHER_SETTING) === true) {
+  const launcher = document.querySelector("[data-h3ps-launcher]");
+  if (launcher) launcher.hidden = hidden;
+  const toggle = studio?.root.querySelector("[data-hide-launcher]");
+  if (toggle) toggle.checked = hidden;
+}
+
+function onLauncherVisibilityChange(hidden, previous) {
+  syncLauncherVisibility(hidden === true);
+  // ComfyUI also calls onChange during registration; only explain a user change.
+  if (!HOST_CAPABILITIES.windowed || hidden !== true || previous !== false) return;
+  const message = "Open Writer from the Comfy menu → Extensions → H3 Prompt Writer → Open H3 Prompt Writer.";
+  if (studio?.root.classList.contains("is-open")) {
+    showToast("H3 button hidden", message, null, null, { dismissOnWorkspaceClick: true });
+  } else {
+    const notice = { severity: "info", summary: "H3 button hidden", detail: message, life: 0, closable: true };
+    app.extensionManager.toast.add(notice);
+    document.addEventListener("pointerdown", () => app.extensionManager.toast.remove(notice), { once: true });
+  }
 }
 
 function installLauncher() {
-  if (document.querySelector("[data-h3ps-launcher]")) return;
+  if (!HOST_CAPABILITIES.windowed) return;
+  const existingLauncher = document.querySelector("[data-h3ps-launcher]");
+  if (existingLauncher?.dataset.h3psLauncherVersion === LAUNCHER_SCHEMA_VERSION) {
+    syncLauncherVisibility();
+    return;
+  }
+  existingLauncher?.remove();
   document.querySelector("[data-h3ps-launcher-group]")?.remove();
   const launcher = document.createElement("button");
   launcher.type = "button";
   launcher.className = "h3ps-floating-launcher";
   launcher.dataset.h3psLauncher = "true";
+  launcher.dataset.h3psLauncherVersion = LAUNCHER_SCHEMA_VERSION;
   launcher.setAttribute("aria-label", "Open H3 Prompt Writer");
   launcher.title = "Open H3 Prompt Writer · drag to move";
   const launcherIcon = new URL("./assets/h3-prompt-writer-launcher.svg", import.meta.url).href;
@@ -3376,16 +4128,56 @@ function installLauncher() {
     if (!saved || drag) return;
     applyPosition(saved);
   });
+  syncLauncherVisibility();
 }
 
 document.addEventListener("keydown", (event) => {
   if (!studio?.root.classList.contains("is-open")) return;
+  const openComposer = studio.root.querySelector(".h3ps-composer.is-open");
+  const openEditor = studio.root.querySelector(".h3ps-media-editor.is-open");
+  if (event.key === "Tab") {
+    const openPopover = studio.root.querySelector("[data-other-models-popover]:not([hidden])");
+    const focusScope = openEditor?.querySelector(".h3ps-ed-dialog") || openComposer?.querySelector(".h3ps-cmp-dialog") || openPopover || studio.root.querySelector(".h3ps-modal");
+    const focusable = Array.from(focusScope.querySelectorAll('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'))
+      .filter((element) => element.getClientRects().length && !element.closest("[hidden]"));
+    if (focusable.length) {
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  }
+  if (openComposer || openEditor) return;
   if (event.key === "Escape") {
     event.preventDefault();
-    if (studio.fullscreen) setFullscreen(false);
+    if (!studio.root.querySelector("[data-clear-menu]").hidden) {
+      setClearMenuOpen(false);
+      return;
+    }
+    const guideMenu = studio.root.querySelector("[data-guide-menu]");
+    const interfaceSizeMenu = studio.root.querySelector("[data-interface-size-menu]");
+    const choiceMenu = Array.from(studio.root.querySelectorAll("[data-choice-menu]")).find((menu) => !menu.hidden);
+    const runtimeMenu = Array.from(studio.root.querySelectorAll("[data-runtime-menu]")).find((menu) => !menu.hidden);
+    if (!interfaceSizeMenu.hidden) {
+      setInterfaceSizeMenuOpen(false, true);
+    } else if (!guideMenu.hidden) {
+      guideMenu.hidden = true;
+      const toggle = studio.root.querySelector("[data-guide-toggle]");
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.focus();
+    } else if (choiceMenu) {
+      choiceMenu.hidden = true;
+      const toggle = studio.root.querySelector(`[data-choice-toggle="${choiceMenu.dataset.choiceMenu}"]`);
+      toggle?.setAttribute("aria-expanded", "false");
+      toggle?.focus();
+    } else if (runtimeMenu) setRuntimeMenuOpen(runtimeMenu.dataset.runtimeMenu, false, true);
     else if (!studio.root.querySelector("[data-other-models-popover]").hidden) setOtherModelsPopover(false);
-    else if (studio.root.querySelector("[data-h3ps-image-preview]").classList.contains("is-open")) closeImagePreview();
-    else if (studio.root.querySelector("[data-h3ps-preview]").classList.contains("is-open")) closeVideoPreview();
+    else if (studio.fullscreen) setFullscreen(false);
     else closeStudio();
   }
   if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
@@ -3398,10 +4190,26 @@ document.addEventListener("keydown", (event) => {
 
 app.registerExtension({
   name: EXTENSION_NAME,
-  commands: [{ id: "h3-prompt-studio.open", label: "Open H3 Prompt Writer", function: openStudio }],
-  menuCommands: [{ path: ["Extensions", "H3 Prompt Writer"], commands: ["h3-prompt-studio.open"] }],
+  settings: [{
+    id: HIDE_LAUNCHER_SETTING,
+    name: "Hide H3 button",
+    type: "boolean",
+    defaultValue: false,
+    onChange: onLauncherVisibilityChange,
+  }],
+  beforeConfigureGraph() { workflowRevision++; },
+  commands: [{ id: "h3-prompt-studio.open", label: "Open H3 Prompt Writer", function: openStudio },
+    { id: "h3-prompt-studio.media", label: "Prompt Writer media over workflow", function: openFloatingMedia }],
+  menuCommands: [{ path: ["Extensions", "H3 Prompt Writer"], commands: ["h3-prompt-studio.open", "h3-prompt-studio.media"] }],
   async setup() {
     injectStyles();
+    installVramHandoff(app, {
+      isEnabled: vramHandoffIsEnabled,
+      onQueueRequested: () => vramHandoffCoordinator.invalidateWriterAttempts(),
+      beforeQueue: unloadWriterModelsBeforeQueue,
+      onError: showVramHandoffQueueError,
+      onQueueHandoffEnd: () => vramHandoffCoordinator.finishQueueHandoff(),
+    });
     installLauncher();
   },
 });

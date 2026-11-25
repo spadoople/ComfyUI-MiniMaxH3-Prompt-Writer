@@ -1,13 +1,43 @@
+import "./focus_lifecycle.mjs";
+import "./api_sampling.mjs";
+import "./api_transport.mjs";
+import "./reference_labels.mjs";
+import "./draft_files.mjs";
+import "./desktop_notifications.mjs";
+import "./launcher_visibility.mjs";
+import { generationButtonMarkup } from "../web/writer_controls.js";
+import { aspectRatioMarkup, splitMenuMarkup } from "../web/writer_controls.js";
+import './media_visual.mjs';
+import './sequence.mjs';
+import "./writer_async.mjs";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import "./composer_geometry.mjs";
+import "./editor_geometry.mjs";
+import "./editor_interactions.mjs";
+import "./media_tools.mjs";
+import "./workflow_media.mjs";
+import "./floating_media.mjs";
 
 const source = await readFile(new URL("../web/compat.js", import.meta.url), "utf8");
 const encoded = Buffer.from(source).toString("base64");
-const { availableReferenceTags, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } = await import(`data:text/javascript;base64,${encoded}`);
+const { availableReferenceTags, comfyVramIsAlreadyEmpty, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } = await import(`data:text/javascript;base64,${encoded}`);
 const responseSource = await readFile(new URL("../web/api/response.js", import.meta.url), "utf8");
 const responseEncoded = Buffer.from(responseSource).toString("base64");
 const { readApiResponse } = await import(`data:text/javascript;base64,${responseEncoded}`);
+const vramHandoffSource = await readFile(new URL("../web/vram_handoff.js", import.meta.url), "utf8");
+const vramHandoffEncoded = Buffer.from(vramHandoffSource).toString("base64");
+const {
+  AUTO_VRAM_TOOLTIP,
+  autoVramControlMarkup,
+  createVramHandoffCoordinator,
+  installVramHandoff,
+  isLocalOllamaHost,
+  releaseComfyVramWhenIdle,
+  unloadWriterModels,
+  writerResidencyTargets,
+} = await import(`data:text/javascript;base64,${vramHandoffEncoded}`);
 const stateSource = await readFile(new URL("../web/studio_state.js", import.meta.url), "utf8");
 const stateEncoded = Buffer.from(stateSource).toString("base64");
 const {
@@ -24,6 +54,7 @@ const {
   buildLyricsRefinePayload,
   buildRefinePayload,
   audioWasAdded,
+  clearPromptDraft,
   createStudioState,
   currentSystemPromptOverride,
   isGenerationModeAvailable,
@@ -35,6 +66,7 @@ const {
   loadOllamaModel,
   loadModeDrafts,
   loadUserPreferences,
+  normalizeCustomFrameCount,
   saveCustomSystemPrompts,
   saveApiProviderConfig,
   saveExternalServerConfig,
@@ -53,8 +85,69 @@ const settingsSource = await readFile(new URL("../web/settings.js", import.meta.
 const settingsEncoded = Buffer.from(settingsSource).toString("base64");
 const { settingsMarkup } = await import(`data:text/javascript;base64,${settingsEncoded}`);
 const mainSource = await readFile(new URL("../web/main.js", import.meta.url), "utf8");
-const skinSource = await readFile(new URL("../web/skin.css", import.meta.url), "utf8");
-const stylesSource = await readFile(new URL("../web/styles.css", import.meta.url), "utf8");
+const composerSource = await readFile(new URL("../web/media_composer.js", import.meta.url), "utf8");
+const styleModules = [
+  "tokens",
+  "themes/dark",
+  "themes/light",
+  "foundation",
+  "shell",
+  "workbench",
+  "media",
+  "composer",
+  "editor",
+  "floating-media",
+  "settings",
+  "models",
+  "providers",
+  "prompts",
+  "overlays",
+  "music",
+  "responsive",
+];
+const styleSources = Object.fromEntries(await Promise.all(styleModules.map(async (name) => [
+  name,
+  await readFile(new URL(`../web/styles/${name}.css`, import.meta.url), "utf8"),
+])));
+const stylesSource = styleModules.map((name) => styleSources[name]).join("\n");
+const skinSource = ["tokens", "themes/dark", "themes/light", "shell", "workbench", "media", "composer", "settings", "models", "providers", "prompts", "overlays", "music", "responsive"]
+  .map((name) => styleSources[name])
+  .join("\n");
+const componentStyleNames = styleModules.filter((name) => !name.startsWith("themes/") && name !== "tokens");
+
+// Legacy opaque literals are kept only until the affected special-case CSS is retired.
+// Alpha colors and artwork/overlay/reference selectors are intentionally handled below.
+const HARDCODED_COLOR_WHITELIST = new Set([
+  "#3b4048", "#484850", "#494951", "#4d4d55", "#4f4f57", "#595961", "#595962", "#62626b",
+  "#686871", "#6d6d76", "#707680", "#737b87", "#7f8d9d", "#ee7049", "#fff", "#fff0eb",
+]);
+
+const HARDCODED_COLOR_SPECIAL_CASE = /(?:rgba?|hsla?|gradient|shadow|backdrop|preview|reference|mark|asset|frame|drag|toast|spinner|primary-button|disabled|drop-before|drop-after)/i;
+const INTERFACE_FIXED_FONT_SELECTOR = /(?:h3ps-section-heading|h3ps-section-hint|h3ps-clear-control|h3ps-output-actions|h3ps-memory-action|h3ps-toggle-control|h3ps-primary-button|h3ps-settings-heading)/i;
+
+function hardcodedColorRecords(source) {
+  return [...source.matchAll(/#[0-9a-f]{3,8}\b|\b(?:white|black)(?=\s*[;,)])/gi)].map((match) => {
+    const lineStart = source.lastIndexOf("\n", match.index) + 1;
+    const lineEnd = source.indexOf("\n", match.index);
+    return { value: match[0].toLowerCase(), line: source.slice(lineStart, lineEnd < 0 ? source.length : lineEnd) };
+  });
+}
+
+function fixedFontSizeViolations(source) {
+  const violations = [];
+  for (const block of source.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selector = block[1].trim();
+    for (const declaration of block[2].matchAll(/font-size\s*:\s*([^;}]*)/g)) {
+      const value = declaration[1].trim();
+      const tokenized = /var\(--h3ps-(?:font|toast-font|interface-scale)/.test(value);
+      const relative = /^[-+]?\d*\.?\d+(?:em|rem|%)$/.test(value) || value === "0";
+      if (!tokenized && !relative && !INTERFACE_FIXED_FONT_SELECTOR.test(selector)) {
+        violations.push(`${selector} -> ${value}`);
+      }
+    }
+  }
+  return violations;
+}
 
 function memoryStorage(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -65,6 +158,17 @@ function memoryStorage(initial = {}) {
     entries: () => Object.fromEntries(values),
   };
 }
+
+test("frontend styles load as ordered modules with scoped dark and light themes", () => {
+  assert.match(mainSource, /const STYLE_MODULES = \[[\s\S]+"tokens"[\s\S]+"themes\/dark"[\s\S]+"themes\/light"[\s\S]+"responsive"/);
+  assert.ok(mainSource.indexOf('"settings"') < mainSource.indexOf('"models"'));
+  assert.match(mainSource, /\.\/styles\/\$\{name\}\.css/);
+  assert.doesNotMatch(mainSource, /\.\/skin\.css|\.\/styles\.css/);
+  assert.match(styleSources["themes/dark"], /--h3ps-bg:/);
+  assert.match(styleSources["themes/light"], /\.h3ps-root\[data-theme="light"\]\s*\{[\s\S]*--h3ps-bg:\s*#f5f7fa;/);
+  assert.doesNotMatch(styleSources["themes/light"], /(^|\n)\s*(?:html|body|:root)\b/);
+  assert.doesNotMatch(styleSources.tokens, /--h3ps-bg:/);
+});
 
 test("API responses preserve structured server errors", async () => {
   const response = {
@@ -120,6 +224,171 @@ test("createSessionId falls back to a valid UUID v4", () => {
 test("createSessionId preserves native randomUUID when available", () => {
   const expected = "11111111-2222-4333-8444-555555555555";
   assert.equal(createSessionId({ randomUUID: () => expected }), expected);
+});
+
+test("VRAM handoff targets only Writer-managed Direct and retained Ollama models", () => {
+  assert.deepEqual(writerResidencyTargets({
+    prompt_residency: {
+      direct: { loaded: true, model_id: "writer.gguf" },
+      ollama: { targets: [
+        { model_id: "gemma4:test", endpoint: "http://127.0.0.1:11434" },
+        { model_id: "gemma4:test", endpoint: "http://127.0.0.1:11434" },
+        { model_id: "remote:test", endpoint: "http://ollama.example:11434" },
+      ] },
+    },
+  }, "http://127.0.0.1:11434"), [
+    { family: "gguf", model_id: "writer.gguf" },
+    { family: "ollama", model_id: "gemma4:test", ollama_host: "http://127.0.0.1:11434" },
+  ]);
+  assert.equal(isLocalOllamaHost("http://localhost:11434"), true);
+  assert.equal(isLocalOllamaHost("http://[::1]:11434"), true);
+  assert.equal(isLocalOllamaHost("http://192.168.0.30:11434"), false);
+});
+
+test("VRAM handoff waits for targeted Writer models to leave residency", async () => {
+  const resident = {
+    prompt_residency: {
+      direct: { loaded: true, model_id: "writer.gguf" },
+      ollama: { targets: [{ model_id: "gemma4:test", endpoint: "http://127.0.0.1:11434" }] },
+    },
+  };
+  const released = { prompt_residency: { direct: { loaded: false }, ollama: { targets: [] } } };
+  const statuses = [resident, released];
+  const unloaded = [];
+  const targets = await unloadWriterModels({
+    getStatus: async () => statuses.shift() || released,
+    unloadModel: async (target) => { unloaded.push(target); return { unload_requested: true }; },
+    ollamaHost: "http://127.0.0.1:11434",
+    sleep: async () => {},
+  });
+  assert.deepEqual(unloaded, targets);
+  assert.deepEqual(unloaded, [
+    { family: "gguf", model_id: "writer.gguf" },
+    { family: "ollama", model_id: "gemma4:test", ollama_host: "http://127.0.0.1:11434" },
+  ]);
+});
+
+test("Auto VRAM skips empty ComfyUI and otherwise confirms stable /free release", async () => {
+  let freeCalls = 0;
+  const alreadyEmpty = await releaseComfyVramWhenIdle({
+    getStatus: async () => ({
+      comfyui: { available: true, queue_running: 0, queue_pending: 0, loaded_models: 0 },
+      gpu_memory: { free_mb: 12000 },
+    }),
+    freeComfyVram: async () => { freeCalls += 1; },
+  });
+  assert.equal(freeCalls, 0);
+  assert.equal(alreadyEmpty.comfyui.loaded_models, 0);
+
+  const freeReadings = [12000, 12016];
+  const statuses = [
+    { comfyui: { available: true, queue_running: 0, queue_pending: 0, loaded_models: 1 }, gpu_memory: { free_mb: 8000 } },
+    ...freeReadings.map((free_mb) => ({
+      comfyui: { available: true, queue_running: 0, queue_pending: 0, loaded_models: 0 },
+      gpu_memory: { free_mb },
+    })),
+  ];
+  const result = await releaseComfyVramWhenIdle({
+    getStatus: async () => statuses.shift(),
+    freeComfyVram: async () => { freeCalls += 1; },
+    sleep: async () => {},
+  });
+  assert.equal(freeCalls, 1);
+  assert.equal(result.comfyui.loaded_models, 0);
+
+  freeCalls = 0;
+  await assert.rejects(releaseComfyVramWhenIdle({
+    getStatus: async () => ({
+      comfyui: { available: true, queue_running: 1, queue_pending: 0, loaded_models: 1 },
+      gpu_memory: { free_mb: 8000 },
+    }),
+    freeComfyVram: async () => { freeCalls += 1; },
+  }), { code: "COMFYUI_BUSY" });
+  assert.equal(freeCalls, 0);
+});
+
+test("Auto VRAM aborts Writer preparation when Queue wins the race", async () => {
+  let current = true;
+  await assert.rejects(releaseComfyVramWhenIdle({
+    getStatus: async () => ({
+      comfyui: { available: true, queue_running: 0, queue_pending: 0, loaded_models: 1 },
+      gpu_memory: { free_mb: 12000 },
+    }),
+    freeComfyVram: async () => { current = false; },
+    isCurrent: () => current,
+  }), { code: "WRITER_PREPARATION_CANCELLED" });
+});
+
+test("VRAM handoff shares preparation without replacing native Queue semantics", async () => {
+  const order = [];
+  const app = {
+    async queuePrompt(value) { order.push(`queue:${value}`); return true; },
+  };
+  let enabled = false;
+  let failures = 0;
+  let releaseHandoff;
+  installVramHandoff(app, {
+    isEnabled: () => enabled,
+    beforeQueue: async () => {
+      order.push("unload");
+      await new Promise((resolve) => { releaseHandoff = resolve; });
+    },
+    onError: () => { failures += 1; },
+  });
+
+  assert.equal(await app.queuePrompt(1), true);
+  enabled = true;
+  const second = app.queuePrompt(2);
+  const third = app.queuePrompt(3);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(order, ["queue:1", "unload"]);
+  releaseHandoff();
+  assert.deepEqual(await Promise.all([second, third]), [true, true]);
+  assert.deepEqual(order, ["queue:1", "unload", "queue:2", "queue:3"]);
+
+  installVramHandoff(app, {
+    isEnabled: () => true,
+    beforeQueue: async () => { throw new Error("unload failed"); },
+    onError: () => { failures += 1; },
+  });
+  const failedA = app.queuePrompt(4);
+  const failedB = app.queuePrompt(5);
+  assert.deepEqual(await Promise.all([failedA, failedB]), [true, true]);
+  assert.equal(failures, 1);
+  assert.deepEqual(order, ["queue:1", "unload", "queue:2", "queue:3", "queue:4", "queue:5"]);
+  installVramHandoff(app, {
+    isEnabled: () => true, timeoutMs: 5,
+    beforeQueue: () => new Promise(() => {}),
+    onError: () => { failures += 1; },
+  });
+  assert.equal(await app.queuePrompt(6), true);
+  assert.equal(failures, 2);
+  assert.equal(order.at(-1), "queue:6");
+});
+
+test("Queue invalidates Writer attempts synchronously and tracked requests remain awaitable", async () => {
+  const coordinator = createVramHandoffCoordinator();
+  const token = coordinator.beginWriterAttempt();
+  assert.equal(coordinator.isWriterAttemptCurrent(token), true);
+  coordinator.invalidateWriterAttempts();
+  assert.equal(coordinator.isWriterAttemptCurrent(token), false);
+  coordinator.finishQueueHandoff();
+  assert.equal(coordinator.isWriterAttemptCurrent(token), false);
+
+  let finish;
+  const request = coordinator.trackWriterRequest(new Promise((resolve) => { finish = resolve; }));
+  assert.equal(coordinator.activeWriterRequest(), request);
+  finish("done");
+  assert.equal(await request, "done");
+  assert.equal(coordinator.activeWriterRequest(), null);
+});
+
+test("Auto VRAM markup is absent outside ComfyUI and carries the approved tooltip", () => {
+  assert.equal(autoVramControlMarkup(false), "");
+  const markup = autoVramControlMarkup(true);
+  assert.match(markup, />Auto VRAM<\/label>/);
+  assert.match(markup, new RegExp(AUTO_VRAM_TOOLTIP.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("replacing a persistent media listener prevents duplicate dispatch", () => {
@@ -227,6 +496,7 @@ test("API provider storage persists configuration but never secret values", () =
     model_id: "provider/model",
     gemini_reasoning_effort: "minimal",
     custom_images: true,
+    sampling: {},
     custom_context_tokens: 32768,
   });
 });
@@ -265,9 +535,13 @@ test("user preferences persist only stable non-secret settings", () => {
     directKvCache: "q8",
     directGenerationBudget: "custom",
     directGenerationBudgetTokens: 6000,
+    ollamaContextTokens: 32768,
     directReasoningEffort: "medium",
     musicLyricsUseBrief: false,
     fullscreen: true,
+    vramHandoff: true,
+    theme: "light",
+    interfaceSize: "125",
     selectedModel: { id: "api::secret-connection::model", api_connection_id: "secret-connection" },
     apiProviderConfig: { api_key: "must-not-be-stored" },
     creativeBrief: "must-not-be-stored",
@@ -289,9 +563,15 @@ test("user preferences persist only stable non-secret settings", () => {
     direct_kv_cache: "q8",
     direct_generation_budget: "custom",
     direct_generation_budget_tokens: 6000,
+    ollama_context_tokens: 32768,
+    ollama_generation_budget: "auto",
+    ollama_generation_budget_tokens: null,
     direct_reasoning_effort: "medium",
     music_lyrics_use_brief: false,
     fullscreen: true,
+    vram_handoff: true,
+    theme: "light",
+    interface_size: "125",
   });
 });
 
@@ -309,6 +589,8 @@ test("user preferences ignore corrupt or unknown versions and sanitize fields", 
       direct_model_id: 123,
       direct_context_profile: "invalid",
       direct_kv_cache: "invalid",
+      theme: "sepia",
+      interface_size: "140",
     }),
   });
   assert.deepEqual(loadUserPreferences(storage), {
@@ -323,9 +605,15 @@ test("user preferences ignore corrupt or unknown versions and sanitize fields", 
     direct_kv_cache: "auto",
     direct_generation_budget: "auto",
     direct_generation_budget_tokens: null,
+    ollama_context_tokens: null,
+    ollama_generation_budget: "auto",
+    ollama_generation_budget_tokens: null,
     direct_reasoning_effort: "auto",
     music_lyrics_use_brief: true,
     fullscreen: false,
+    vram_handoff: false,
+    theme: "dark",
+    interface_size: "100",
   });
 });
 
@@ -344,6 +632,9 @@ test("studio restores safe preferences but not transient lifecycle state", () =>
       direct_generation_budget: "4096",
       direct_reasoning_effort: "low",
       fullscreen: true,
+      vram_handoff: true,
+      theme: "light",
+      interface_size: "120",
       ollama_context_profile: "standard",
     }),
   });
@@ -360,6 +651,9 @@ test("studio restores safe preferences but not transient lifecycle state", () =>
   assert.equal(state.directReasoningEffort, "low");
   assert.equal(state.musicLyricsUseBrief, true);
   assert.equal(state.fullscreen, true);
+  assert.equal(state.vramHandoff, true);
+  assert.equal(state.theme, "light");
+  assert.equal(state.interfaceSize, "120");
   assert.equal(state.ollamaContextProfile, undefined);
   assert.equal(state.keepModelLoaded, false);
   assert.equal(state.thinking, false);
@@ -371,6 +665,9 @@ test("a clean first run defaults to Ollama while saved provider preferences rema
   const clean = createStudioState({ sessionId: "clean", storage: memoryStorage() });
   assert.equal(clean.settingsProvider, "ollama");
   assert.equal(clean.preferredProvider, "ollama");
+  assert.equal(clean.vramHandoff, false);
+  assert.equal(clean.theme, "dark");
+  assert.equal(clean.interfaceSize, "100");
 
   const saved = createStudioState({
     sessionId: "saved",
@@ -449,6 +746,13 @@ test("Audio added notice remains visible for six seconds", () => {
   assert.match(mainSource, /"Audio added"[\s\S]{0,280}\{ durationMs: 6000 \}/);
 });
 
+test("mode drafts round trip prompts longer than 16k without truncation", () => {
+  const storage = memoryStorage();
+  const prompt = "Long prompt 🙂\n".repeat(2000);
+  saveModeDrafts(storage, { Reference: { brief: "brief", prompt } });
+  assert.equal(loadModeDrafts(storage).Reference.prompt, prompt);
+});
+
 test("all mode drafts persist independently across reloads", () => {
   const storage = memoryStorage();
   saveModeDrafts(storage, {
@@ -465,14 +769,44 @@ test("all mode drafts persist independently across reloads", () => {
   assert.deepEqual(createStudioState({ sessionId: "drafts", storage }).modeDrafts.T2VA, { brief: "Text brief", prompt: "Text prompt" });
 });
 
-test("video drafts preserve the 8000 character brief while Music keeps 2000", () => {
+test("clear prompts removes brief and generated output while preserving lyrics and extra draft state", () => {
+  assert.deepEqual(clearPromptDraft({
+    brief: "Keep the camera static.",
+    prompt: "Generated prompt",
+    lyrics: "[Verse]\nKeep these lyrics",
+    marker: "preserved",
+  }), {
+    brief: "",
+    prompt: "",
+    lyrics: "[Verse]\nKeep these lyrics",
+    marker: "preserved",
+  });
+  assert.match(mainSource, /data-clear-media><strong>Clear media<\/strong>/);
+  assert.match(mainSource, /data-clear-prompts><strong>Clear prompts<\/strong><small>Keep media<\/small>/);
+  assert.match(mainSource, /data-clear-all><strong>Clear all<\/strong><small>Media and prompts<\/small>/);
+  assert.match(mainSource, /if \(!await clearCurrentMedia\(\{ notify: false \}\)\) return;/);
+  assert.match(stylesSource, /\.h3ps-clear-control \{[^}]*display: inline-flex;[^}]*border-radius: 7px;/);
+  assert.match(stylesSource, /\.h3ps-clear-menu \{[^}]*right: -20px;[^}]*width: max-content;[^}]*max-width: calc\(100vw - 24px\);/);
+  assert.match(stylesSource, /\.h3ps-clear-menu button \{[^}]*display: grid;[^}]*min-height: calc\(42px \* var\(--h3ps-interface-scale\)\);/);
+  assert.match(stylesSource, /\.h3ps-clear-menu button strong \{[^}]*font-size: 1em;[^}]*letter-spacing: normal;/);
+});
+
+test("custom contact sheet counts accept only whole values from 2 through 24", () => {
+  assert.equal(normalizeCustomFrameCount("2"), "2");
+  assert.equal(normalizeCustomFrameCount(16), "16");
+  for (const value of [1, 25, 2.5, "2.5", "custom", ""]) {
+    assert.equal(normalizeCustomFrameCount(value), null);
+  }
+});
+
+test("long video drafts remain intact while Music keeps 2000", () => {
   const storage = memoryStorage();
   saveModeDrafts(storage, {
-    T2VA: { brief: "v".repeat(8000), prompt: "Video prompt" },
+    T2VA: { brief: "v".repeat(40000), prompt: "Video prompt" },
     Music3: { brief: "m".repeat(8000), prompt: "Music prompt", lyrics: "Lyrics" },
   });
   const drafts = loadModeDrafts(storage);
-  assert.equal(drafts.T2VA.brief.length, 8000);
+  assert.equal(drafts.T2VA.brief.length, 40000);
   assert.equal(drafts.Music3.brief.length, 2000);
 });
 
@@ -587,12 +921,77 @@ test("Reference assets replace one dropped file and append multiple dropped file
 test("media card overlays stay inside the thumbnail and below previews", () => {
   assert.match(stylesSource, /\.h3ps-duration\s*\{[^}]*position:\s*absolute;[^}]*right:\s*7px;[^}]*bottom:\s*49px;/);
   assert.match(stylesSource, /\.h3ps-replace-asset, \.h3ps-remove-asset \{[^}]*width:\s*22px;[^}]*height:\s*22px;/);
+  assert.match(stylesSource, /\.h3ps-root \.h3ps-replace-asset svg, \.h3ps-root \.h3ps-remove-asset svg \{ width:12px; height:12px; \}/);
   assert.match(stylesSource, /\.h3ps-replace-asset \{[^}]*top:\s*32px;[^}]*right:\s*6px;/);
   assert.match(stylesSource, /\.h3ps-asset:hover \.h3ps-replace-asset[^}]*opacity:\s*1;/);
   assert.match(stylesSource, /\.h3ps-asset:hover \.h3ps-remove-asset[^}]*opacity:\s*1;/);
   assert.doesNotMatch(stylesSource, /\.h3ps-asset:focus-within \.h3ps-(?:replace|remove)-asset/);
   assert.doesNotMatch(stylesSource, /\.h3ps-more|\.h3ps-asset-menu/);
-  assert.match(stylesSource, /\.h3ps-video-preview, \.h3ps-image-preview \{[^}]*z-index:\s*20;/);
+});
+
+test("Actions keeps media tools ordered and explains unavailable states without hiding Compose", async () => {
+  const { mediaVisualDescriptor } = await import("../web/media_visual.js");
+  const markup = mainSource.slice(mainSource.indexOf('${splitMenuMarkup(icon, {label: "Actions"'), mainSource.indexOf('<p class="h3ps-section-hint"'));
+  assert.match(markup, /data-media-panel-action[\s\S]*data-open-composer[\s\S]*<hr data-compose-separator>[\s\S]*data-clear-media[\s\S]*data-clear-prompts[\s\S]*data-clear-all/);
+  assert.doesNotMatch(markup, /data-open-composer[^>]*hidden|data-compose-separator[^>]*hidden/);
+  assert.match(stylesSource, /\.h3ps-clear-menu button:disabled \{ opacity: .45; cursor: default;/);
+  const panel = {}, compose = {};
+  const studio = { mode: "Reference", assets: [], requestBusy: false, root: {
+    querySelector: selector => selector === "[data-media-panel-action]" ? panel : compose,
+  } };
+  const controlSource = mainSource.slice(mainSource.indexOf("function referenceComposerAssets("), mainSource.indexOf("async function addComposedPicture("));
+  const sync = new Function("studio", "mediaVisualDescriptor", controlSource + ";return syncComposerControl;")(studio, mediaVisualDescriptor);
+  sync();
+  assert.equal(panel.disabled, true); assert.equal(panel.title, "Add media first");
+  assert.equal(compose.disabled, true); assert.equal(compose.title, "Add a Picture or Video first");
+  studio.assets = [{ type: "audio", mode: "Reference", content_url: "audio" }];
+  sync(); assert.equal(panel.disabled, false); assert.equal(compose.disabled, true);
+  studio.assets.push({ type: "video", mode: "Reference", content_url: "video" });
+  sync(); assert.equal(compose.disabled, true);
+  studio.assets[1].contact_sheet_url = "sheet";
+  sync(); assert.equal(compose.disabled, false);
+  studio.requestBusy = true;
+  sync(); assert.equal(compose.disabled, true); assert.match(compose.title, /Wait/);
+  studio.requestBusy = false;
+  for (const mode of ["T2VA", "I2VA", "FL2VA", "Music3"]) {
+    sync(mode); assert.equal(compose.disabled, true); assert.match(compose.title, /Reference/);
+    assert.equal(panel.disabled, false); assert.equal(compose.hidden, undefined);
+  }
+  studio.assets = Array.from({length:9}, () => ({type:"image", mode:"Reference", content_url:"picture"}));
+  sync(); assert.equal(compose.disabled, false); // The full Picture quota still permits copy and download.
+  studio.assets = [];
+  sync(); assert.equal(panel.disabled, true); assert.equal(compose.disabled, true);
+});
+
+test("Media Composer creates an independent Picture from prepared visual sources", () => {
+  assert.match(mainSource, /await import\("\.\/media_composer\.js"\)/);
+  assert.match(mainSource, /"media",\s*"composer",\s*"editor",\s*"floating-media",\s*"settings"/);
+  assert.match(mainSource, /data-open-composer disabled/);
+  assert.match(mainSource, /uploadMedia\(studio\.sessionId, "Reference", \[file\]\)/);
+  assert.match(mainSource, /studio\.assets = \[\.\.\.studio\.assets, \.\.\.result\.assets\]/);
+  assert.match(mainSource, /pictureCount >= 9/);
+  assert.match(mainSource, /assets\.length >= 12/);
+  assert.match(composerSource, /mediaVisualDescriptor as defaultVisualDescriptor/);
+  assert.match(composerSource, /asset\.contact_sheet_url/);
+  assert.match(composerSource, /ctx\.drawImage\(bitmap,it\.x,it\.y,it\.w,it\.h\)/);
+  assert.doesNotMatch(composerSource, /\bCover\b|background selector|transform:\s*scale/);
+  assert.match(composerSource, /\["auto", "Auto"\]/);
+  assert.match(composerSource, /data-value="auto">Auto<\/button><button type="button" data-value="2">2 cols<\/button><button type="button" data-value="3">3 cols<\/button><button type="button" data-value="grid">Grid<\/button>/);
+  assert.match(composerSource, /if\(d\.type==="resize"\)[\s\S]{0,240}d\.it\.weight=/);
+  assert.match(composerSource, /if \(r\) \{ W=Math\.max\(reqW, reqH\*r\)/);
+  assert.match(composerSource, /drawOutput\(canvas\.getContext\("2d"\),r\.W,r\.H,false\)/);
+  assert.match(composerSource, /data-copy[^>]*aria-label="Copy PNG">\$\{i\("copy", 14\)\}<\/button>/);
+  assert.match(composerSource, /ClipboardItem\(\{"image\/png":png\}\)/);
+  assert.match(composerSource, /data-download[^>]*>\$\{i\("download", 13\)\}Download<\/button>/);
+  assert.match(composerSource, /URL\.createObjectURL\(payload\.blob\)/);
+  assert.doesNotMatch(composerSource, /showReferenceLabels|referenceLabelRect|drawReferenceLabels|data-reference-labels/);
+  assert.doesNotMatch(composerSource, /data-label-layer/);
+  assert.match(composerSource, /b\.disabled=!layoutAvailable\(b\.dataset\.value\)/);
+  assert.match(composerSource, /pad=Math\.max\(10,c\?\.fontSize\*\.45\|\|0\)/);
+  assert.match(composerSource, /requestAnimationFrame\(positionCaptionUI\)/);
+  assert.match(styleSources.composer, /caption-inline textarea\{[^}]*color:var\(--h3ps-canvas-text\)/);
+  assert.match(styleSources.composer, /\.h3ps-cmp-source\{cursor:grab/);
+  assert.doesNotMatch(styleSources.composer, /\.h3ps-cmp-source\{height:104px/);
 });
 
 test("VRAM retry waits for the required free-memory target", () => {
@@ -600,6 +999,22 @@ test("VRAM retry waits for the required free-memory target", () => {
   assert.equal(vramReleaseReachedTarget(4_000, 10_000, 10_000), true);
   assert.equal(vramReleaseReachedTarget(4_000, 4_063), false);
   assert.equal(vramReleaseReachedTarget(4_000, 4_064), true);
+});
+
+test("manual VRAM release skips polling when idle ComfyUI has no loaded models", () => {
+  assert.equal(comfyVramIsAlreadyEmpty({
+    comfyui: { available: true, queue_running: 0, queue_pending: 0, loaded_models: 0 },
+  }), true);
+  assert.equal(comfyVramIsAlreadyEmpty({
+    comfyui: { available: true, queue_running: 1, queue_pending: 0, loaded_models: 0 },
+  }), false);
+  assert.equal(comfyVramIsAlreadyEmpty({
+    comfyui: { available: true, queue_running: 0, queue_pending: 0, loaded_models: 1 },
+  }), false);
+  assert.equal(comfyVramIsAlreadyEmpty({
+    comfyui: { available: false, queue_running: 0, queue_pending: 0, loaded_models: 0 },
+  }), false);
+  assert.match(mainSource, /typeof retry !== "function" && requiredFree == null && comfyVramIsAlreadyEmpty\(before\)/);
 });
 
 test("Direct context preferences preserve Qwen 32K and 48K tiers", () => {
@@ -617,11 +1032,52 @@ test("Direct Thinking is disabled when the GGUF template has no detected control
 
 test("External llama.cpp keeps reasoning under server control", () => {
   assert.match(mainSource, /externalManaged = studio\.selectedModel\?\.family === "external"/);
-  assert.match(mainSource, /Thinking is managed by the external llama\.cpp server\./);
+  assert.match(mainSource, /Thinking is controlled by the external llama\.cpp server\./);
+  assert.match(mainSource, /--reasoning on --reasoning-effort low/);
+  assert.match(mainSource, /external \? null : `Thinking/);
   assert.match(stateSource, /state\.selectedModel\?\.family === "external" \? false : state\.thinking/);
 });
 
-test("text-only Direct models expose only T2VA", () => {
+test("External llama.cpp offers capability-driven two-way Auto VRAM", () => {
+  assert.match(mainSource, /\["gguf", "external"\]\.includes\(model\?\.family\)/);
+  assert.match(AUTO_VRAM_TOOLTIP, /lifecycle-capable External llama\.cpp routers/);
+
+  const queueHandoffStart = mainSource.indexOf("async function unloadWriterModelsBeforeQueue(signal)");
+  const queueHandoffEnd = mainSource.indexOf("\nfunction showVramHandoffQueueError", queueHandoffStart);
+  assert.ok(queueHandoffStart >= 0 && queueHandoffEnd > queueHandoffStart);
+  const queueHandoffSource = mainSource.slice(queueHandoffStart, queueHandoffEnd);
+  assert.match(queueHandoffSource, /activeFamily === "gguf"/);
+  assert.match(queueHandoffSource, /activeFamily === "ollama"/);
+  assert.match(queueHandoffSource, /activeFamily === "external" && studio\?\.selectedModel\?\.lifecycle_supported/);
+});
+
+test("verified router manual Unload stays visible across residency refreshes",()=>{
+  const start=mainSource.indexOf('function lifecycleTargets()'), end=mainSource.indexOf('function syncLifecycleActions',start);
+  const render=new Function('studio','escapeHtml',mainSource.slice(start,end)+'; return lifecycleTargets().map(t=>lifecycleButtonMarkup(t)).join("");');
+  const id='external::local::writer';
+  for (const [state,owned,enabled] of [['loaded',true,true],['sleeping',false,true],['loading',true,false],['unloading',true,false],['unloaded',false,false],['unknown',true,true],['unknown',false,false]]) {
+    const html=render({selectedModel:{id,family:'external',lifecycle_supported:true},promptResidency:{direct:null,ollama:[],external:[{model_id:id,state,writer_owned:owned}]}},String);
+    assert.equal((html.match(/data-lifecycle-family=/g)||[]).length,1);
+    assert.equal(html.includes(' disabled '),!enabled,state);
+  }
+  assert.match(render({selectedModel:{id,family:'external',lifecycle_supported:true},promptResidency:{direct:null,ollama:[],external:[]}},String),/disabled/);
+});
+
+test("External queue handoff waits for exact unloaded status and fails closed on lost status",async()=>{
+  const modelId='external::local::writer',target={family:'external',model_id:modelId},calls=[];
+  const status=state=>({prompt_residency:{external:{targets:[{model_id:modelId,state,writer_owned:true}]}}});
+  const samples=[status('loaded'),status('loading'),status('unloaded')];
+  const result=await unloadWriterModels({getStatus:async()=>samples.shift(),unloadModel:async t=>{calls.push(t);return {unload_requested:true};},sleep:async()=>{}});
+  assert.deepEqual(result,[target]);assert.deepEqual(calls,[target]);
+  await assert.rejects(()=>unloadWriterModels({
+    getStatus:async()=>status('unknown'),requiredTargets:[target],unloadModel:async()=>({unload_requested:true}),sleep:async()=>{},maxPolls:1,
+  }),error=>error.code==='WRITER_UNLOAD_TIMEOUT');
+  await assert.rejects(()=>unloadWriterModels({
+    getStatus:async()=>status('loaded'),unloadModel:async()=>({unload_requested:false}),
+  }),error=>error.code==='WRITER_UNLOAD_FAILED');
+});
+
+test("text-only Direct models expose T2VA and Music3", () => {
   const textOnly = {
     id: "direct-text-only",
     family: "gguf",
@@ -637,7 +1093,8 @@ test("text-only Direct models expose only T2VA", () => {
 
   assert.equal(isTextOnlyDirectModel(textOnly), true);
   assert.equal(isGenerationModeAvailable(textOnly, "T2VA"), true);
-  for (const mode of ["I2VA", "FL2VA", "L2VA", "Reference", "Music3"]) {
+  assert.equal(isGenerationModeAvailable(textOnly, "Music3"), true);
+  for (const mode of ["I2VA", "FL2VA", "L2VA", "Reference"]) {
     assert.equal(isGenerationModeAvailable(textOnly, mode), false);
   }
   assert.equal(isTextOnlyDirectModel(vision), false);
@@ -710,6 +1167,10 @@ test("Generate and Refine payloads are built from state rather than Settings DOM
   assert.equal(ollamaPayload.api_provider, null);
   assert.equal(ollamaPayload.context_profile, "auto");
   assert.equal(ollamaPayload.kv_cache, "auto");
+  state.ollamaContextTokens = 32768;
+  const customContext = buildGeneratePayload(state, { creativeBrief: "A quiet shot." });
+  assert.equal(customContext.context_profile, "custom");
+  assert.equal(customContext.context_tokens, 32768);
 
   const apiModel = {
     id: "api::connection-id::provider/model",
@@ -749,6 +1210,13 @@ test("Ollama remote host controls stay collapsed and disclosure state survives r
   assert.match(mainSource, /data-ollama-storage-help \$\{studio\.ollamaStorageHelpOpen \? "open" : ""\}/);
   assert.match(mainSource, /studio\.ollamaStorageHelpOpen = !ollamaStorageSummary\.closest\("details"\)\.open/);
   assert.match(skinSource, /\.h3ps-ollama-host-settings/);
+});
+
+test("automatic Ollama refresh renders preserve the unsaved host field value", () => {
+  assert.match(mainSource, /const ollamaHostDraft = studio\.root\.querySelector\('\[data-ollama-host-form\] input\[name="host"\]'\)\?\.value/);
+  assert.match(mainSource, /renderOllamaProviderControl\(ollamaHostDraft\)/);
+  assert.match(mainSource, /ollamaHostControlMarkup\(hostValue = studio\.ollamaHost\)/);
+  assert.match(mainSource, /value="\$\{escapeHtml\(hostValue\)\}"/);
 });
 
 test("background model discovery does not override an open Settings provider tab", () => {
@@ -799,7 +1267,7 @@ test("Settings separates providers, installed models, diagnostics, and verified 
   assert.doesNotMatch(mainSource, /data-developer-mode/);
   assert.doesNotMatch(markup, /Prompt models/);
   assert.doesNotMatch(markup, /data-model-menu/);
-  assert.match(markup, /<strong>Context<\/strong>/);
+  assert.doesNotMatch(markup, /<strong>Context<\/strong>/);
   assert.match(mainSource, /llama-cpp-python is not installed/);
   assert.match(mainSource, /data-copy-direct-runtime-command/);
   assert.match(mainSource, /Close ComfyUI, run this from your ComfyUI Portable folder/);
@@ -814,7 +1282,7 @@ test("Settings separates providers, installed models, diagnostics, and verified 
   assert.match(mainSource, /Troubleshooting ↗/);
   assert.match(mainSource, /refreshGGUFRuntimeDiagnostics\(\)/);
   assert.match(markup, /h3ps-model-icon h3ps-provider-icon[^>]+data-provider-icon="direct"/);
-  assert.match(mainSource, /runtimeSettings\.hidden = provider !== "direct"/);
+  assert.match(mainSource, /runtimeSettings\.hidden = !\["direct", "ollama"\]\.includes\(provider\)/);
   assert.doesNotMatch(mainSource, /Context is sent explicitly with each request/);
   assert.match(mainSource, /studio\.selectedModel\?\.family === "gguf"/);
   assert.doesNotMatch(mainSource, /\/api\/pull/);
@@ -830,7 +1298,7 @@ test("Settings separates providers, installed models, diagnostics, and verified 
   assert.match(mainSource, /data-ollama-model/);
   assert.match(mainSource, /data-ollama-add-model/);
   assert.match(mainSource, /\+ Add model/);
-  assert.match(skinSource, /h3ps-root \.h3ps-ollama-add-model-toggle[^}]+color: var\(--h3ps-accent-strong\)[^}]+font-size: 9\.5px[^}]+cursor: pointer/);
+  assert.match(skinSource, /h3ps-root \.h3ps-ollama-add-model-toggle[^}]+color: var\(--h3ps-accent-strong\)[^}]+font-size: var\(--h3ps-font-label-sm\)[^}]+cursor: pointer/);
   assert.match(skinSource, /h3ps-ollama-model-select select[\s\S]{0,900}background-position: right 12px center[\s\S]{0,300}cursor: pointer/);
   assert.match(skinSource, /h3ps-api-model-select select[\s\S]{0,900}background-position: right 12px center[\s\S]{0,300}cursor: pointer/);
   assert.match(mainSource, /Choose another tested model/);
@@ -856,7 +1324,7 @@ test("Settings separates providers, installed models, diagnostics, and verified 
 test("Reference defaults use plain Picture 1 and Video 1 text while canonical tags remain user-authored", () => {
   assert.match(mainSource, /const REFERENCE_DEFAULT_BRIEF = ["`][^"`]*Picture 1[^"`]*Video 1[^"`]*["`]/s);
   assert.doesNotMatch(mainSource.match(/const REFERENCE_DEFAULT_BRIEF = ["`][^"`]*["`]/s)?.[0] || "", /<Picture 1>|<Video 1>/);
-  assert.match(skinSource, /\.h3ps-root\.is-fullscreen \.h3ps-assets:has\(> \.h3ps-empty-drop:only-child\) \{ grid-template-columns: minmax\(0, 1fr\); \}/);
+  assert.match(skinSource, /\.h3ps-assets:has\(> \.h3ps-empty-drop:only-child\) \{ grid-template-columns: minmax\(0, 1fr\); \}/);
 });
 
 test("Settings shows compact global System Prompt summaries and an on-demand editor", () => {
@@ -879,6 +1347,14 @@ test("Settings shows compact global System Prompt summaries and an on-demand edi
   assert.doesNotMatch(markup, /data-comfy-memory-action/);
   assert.match(mainSource, /data-thinking/);
   assert.match(mainSource, /data-keep-loaded/);
+  assert.match(mainSource, /autoVramControlMarkup\(VRAM_HANDOFF_SUPPORTED\)/);
+  assert.match(vramHandoffSource, />Auto VRAM<\/label>/);
+  assert.match(vramHandoffSource, /data-vram-handoff-control/);
+  assert.match(mainSource, /isLocalOllamaHost\(studio\.ollamaHost\)/);
+  assert.match(mainSource, /VRAM_HANDOFF_SUPPORTED = typeof app\?\.queuePrompt === "function"/);
+  assert.match(mainSource, /installVramHandoff\(app/);
+  assert.match(mainSource, /releaseComfyVramWhenIdle\(\{/);
+  assert.match(mainSource, /onQueueRequested: \(\) => vramHandoffCoordinator\.invalidateWriterAttempts\(\)/);
   assert.match(mainSource, /data-comfy-memory-action/);
   const freeVramStart = mainSource.indexOf("async function releaseComfyVram");
   const freeVramEnd = mainSource.indexOf("function showVramRetry", freeVramStart);
@@ -954,22 +1430,12 @@ test("Settings owns a two-click restore for all mode draft defaults", () => {
   assert.match(stylesSource, /h3ps-draft-defaults-action/);
 });
 
-test("Reference mode exposes one contextual insert control across its three editors", () => {
-  assert.equal((mainSource.match(/data-reference-insert-toggle/g) || []).length >= 2, true);
-  assert.match(mainSource, /aria-label="Insert reference"/);
-  assert.match(mainSource, /data-reference-insert-toggle><\/button>/);
-  assert.doesNotMatch(mainSource, /data-reference-insert-toggle[^>]*>[\s\S]{0,120}<span>Insert<\/span>/);
-  assert.match(stylesSource, /assets\/icons\/insert-reference\.svg/);
-  assert.match(mainSource, /studio\.mode !== "Reference"/);
-  assert.match(mainSource, /querySelectorAll\("\[data-video-brief\], \[data-output\], \[data-refine-instruction\]"\)/);
+test("media labels insert references at the last editor caret without opening the inspector", () => {
+  assert.doesNotMatch(mainSource, /data-reference-insert-toggle|h3ps-edit-asset/);
+  assert.match(mainSource, /data-media-tag/);
   assert.match(mainSource, /insertReferenceAtCaret\(target\.editor, reference, target\.caret\)/);
   assert.match(mainSource, /\["focus", "click", "keyup", "select", "input"\]/);
-  assert.match(mainSource, /if \(!event\.target\.closest\("\[data-reference-insert\]"\)\) closeReferenceInsert\(\)/);
-  assert.match(stylesSource, /h3ps-output-panel\.is-refining \[data-refine-toggle\] \{ display: none; \}/);
-  assert.doesNotMatch(stylesSource, /h3ps-output-panel\.is-refining \.h3ps-output-actions \{ display: none; \}/);
-  for (const kind of ["subject", "image", "video", "audio"]) {
-    assert.match(stylesSource, new RegExp(`h3ps-editor-highlight mark\\.is-${kind}, \\.h3ps-reference-chip\\.is-${kind}`));
-  }
+  assert.match(mainSource, /studio.mediaEditor.open\(asset,button\)/);
 });
 
 test("Music 3 drafts and payload keep lyrics separate from H3 state", () => {
@@ -1037,7 +1503,7 @@ test("Music 3 drafts and payload keep lyrics separate from H3 state", () => {
   assert.match(mainSource, /Leave Lyrics empty to create new lyrics, or describe how to rewrite the existing lyrics\./);
   assert.match(mainSource, /data-lyrics-use-brief checked/);
   assert.doesNotMatch(mainSource, /data-(?:lyrics-)?refine-submit[^>]*>[\s\S]{0,80}Rewrite<\/button>/);
-  const requestIndex = mainSource.indexOf("const result = await refine(buildLyricsRefinePayload");
+  const requestIndex = mainSource.indexOf("trackWriterRequest(refine(buildLyricsRefinePayload");
   const lyricsAssignmentIndex = mainSource.indexOf("lyrics.value = result.prompt", requestIndex);
   assert.ok(requestIndex >= 0 && lyricsAssignmentIndex > requestIndex);
   assert.match(mainSource, /studio\.lyricsRestore = \{ lyrics: currentLyrics \}[\s\S]{0,180}lyrics\.value = result\.prompt/);
@@ -1057,14 +1523,143 @@ test("active requests block add, reorder, and mode switching", () => {
   assert.match(mainSource, /const unavailable = !isGenerationModeAvailable[\s\S]{0,180}control\.disabled = studio\.requestBusy \|\| unavailable/);
 });
 
-test("text-only Direct UI disables visual and Music modes and explains the fallback", () => {
+test("text-only Direct UI disables visual modes and explains the fallback", () => {
   assert.match(mainSource, /function syncModeAvailability\(\)/);
-  assert.match(mainSource, /data-workspace[\s\S]{0,220}control\.dataset\.workspace === "music"/);
-  assert.match(mainSource, /Text-only model · T2VA available/);
+  assert.match(mainSource, /Text-only model · T2VA and Music3 available/);
   assert.match(mainSource, /Switched to T2VA/);
   assert.match(mainSource, /if \(!generationModeIsAvailable\(\)\) return/);
   assert.match(stylesSource, /\.h3ps-modes button:disabled/);
   assert.match(skinSource, /\.h3ps-workspaces button:disabled/);
+});
+
+test("closed Prompt Writer does not advertise an active modal", () => {
+  assert.match(mainSource, /<section class="h3ps-modal" role="dialog" aria-label="H3 Prompt Writer" hidden>/);
+  assert.doesNotMatch(mainSource, /<section class="h3ps-modal" role="dialog" aria-modal="true"/);
+});
+
+test("theme selection is scoped, persisted, and exposed in the main header", () => {
+  const markup = settingsMarkup(() => "");
+  assert.doesNotMatch(markup, /data-theme-option|Color theme/);
+  assert.match(mainSource, /data-theme-toggle>\$\{icon\("sun", 17\)\}/);
+  assert.match(mainSource, /icon\(light \? "moon" : "sun", 17\)/);
+  assert.match(mainSource, /studio\.root\.dataset\.theme = studio\.theme/);
+  assert.match(mainSource, /setTheme\(studio\.theme === "light" \? "dark" : "light"\)/);
+  assert.match(styleSources["themes/dark"], /\.h3ps-root\s*\{[\s\S]*--h3ps-bg:\s*#09090a;[\s\S]*color-scheme:\s*dark;/);
+  assert.match(styleSources["themes/light"], /\.h3ps-root\[data-theme="light"\]\s*\{[\s\S]*--h3ps-text:\s*#1f2935;[\s\S]*color-scheme:\s*light;/);
+  assert.match(styleSources.settings, /background:\s*var\(--h3ps-settings-header\)/);
+  assert.match(styleSources.workbench, /background:\s*var\(--h3ps-output-surface\)/);
+  assert.match(styleSources.settings, /background:\s*var\(--h3ps-field\)/);
+});
+
+test("theme maintenance guard keeps component colors on the token path", () => {
+  const colorViolations = [];
+  for (const name of componentStyleNames) {
+    for (const record of hardcodedColorRecords(styleSources[name])) {
+      if (!HARDCODED_COLOR_WHITELIST.has(record.value) && !HARDCODED_COLOR_SPECIAL_CASE.test(record.line)) {
+        colorViolations.push(`${name}: ${record.value}`);
+      }
+    }
+  }
+  assert.deepEqual(colorViolations, [], "new opaque component colors need a theme token or an explicit special-case whitelist");
+  assert.match(styleSources.tokens, /--h3ps-accent:\s*#e8613c;/);
+  assert.doesNotMatch(styleSources["themes/dark"], /--h3ps-accent:/);
+  assert.match(styleSources["themes/light"], /--h3ps-surface-raised:\s*var\(--h3ps-surface\);/);
+  assert.match(styleSources["themes/light"], /--h3ps-border-control:\s*var\(--h3ps-border\);/);
+});
+test("interface size is token-based, persisted, and exposed as a header slider", () => {
+  const markup = settingsMarkup(() => "");
+  assert.doesNotMatch(markup, /Interface Size|data-interface-size/);
+  assert.match(mainSource, /data-interface-size-toggle>Aa<\/button>/);
+  assert.match(mainSource, /type="range" min="0" max="3" step="1"[^>]*data-interface-size-range/);
+  assert.match(mainSource, /INTERFACE_SIZES\[Number\(event\.target\.value\)\]/);
+  assert.match(mainSource, /setAttribute\("aria-valuetext", `\$\{size\}%`\)/);
+  assert.match(mainSource, /studio\.root\.dataset\.interfaceSize = size/);
+  assert.match(styleSources.tokens, /--h3ps-interface-scale:\s*1;/);
+  assert.match(styleSources.tokens, /\[data-interface-size="110"\][^}]*--h3ps-interface-scale:\s*1\.1/);
+  assert.match(styleSources.tokens, /\[data-interface-size="120"\][^}]*--h3ps-interface-scale:\s*1\.2/);
+  assert.match(styleSources.tokens, /\[data-interface-size="125"\][^}]*--h3ps-interface-scale:\s*1\.25/);
+  assert.match(styleSources.tokens, /--h3ps-font-body:\s*calc\(12px \* var\(--h3ps-interface-scale\)\)/);
+  assert.match(styleSources.foundation, /--h3ps-icon-size\) \* var\(--h3ps-interface-scale\)/);
+  assert.match(styleSources.tokens, /--h3ps-interface-scale-soft:\s*1;/);
+  assert.match(styleSources.tokens, /\[data-interface-size="125"\][^}]*--h3ps-interface-scale-soft:\s*1\.125/);
+  assert.match(styleSources.settings, /\.h3ps-settings-heading > \.h3ps-secondary-button \{[^}]*height:calc\(30px \* var\(--h3ps-interface-scale-soft\)\);[^}]*font-size:calc\(10\.5px \* var\(--h3ps-interface-scale-soft\)\);/);
+  assert.match(styleSources.workbench, /\.h3ps-output-actions \.h3ps-secondary-button \{[^}]*height: 34px;[^}]*font-size: 11px;/);
+  assert.match(styleSources.workbench, /\.h3ps-memory-action \{[^}]*height: 30px;[^}]*font-size: 10px;/);
+  assert.match(styleSources.workbench, /\.h3ps-toggle-control \{[^}]*min-height: 28px;[^}]*font-size: 10\.5px;/);
+  assert.match(styleSources.workbench, /\.h3ps-primary-button \{[^}]*height: 36px;[^}]*font-size: 10\.5px;/);
+  assert.match(styleSources.workbench, /\.h3ps-section-heading strong \{ font-size: 15px; \}/);
+  assert.match(styleSources.shell, /\.h3ps-guide-menu \{[^}]*background: var\(--h3ps-popover\)/);
+  assert.match(styleSources.shell, /\.h3ps-guide-menu a:hover \{ background: var\(--h3ps-menu-hover\); \}/);
+  assert.match(styleSources.tokens, /--h3ps-toast-scale:\s*calc\(1\.25 \* var\(--h3ps-interface-scale\)\)/);
+  assert.match(styleSources.overlays, /min-width:\s*min\(var\(--h3ps-toast-min-width\), calc\(100vw - 24px\)\)/);
+  assert.match(styleSources.overlays, /font-size:\s*var\(--h3ps-toast-font-title\)/);
+  assert.match(styleSources.workbench, /\.h3ps-spinner \{[^}]*display:inline-block;[^}]*animation: h3ps-spin \.7s linear infinite;/);
+  assert.match(styleSources.responsive, /prefers-reduced-motion:[^)]+\)[\s\S]*\.h3ps-root \.h3ps-spinner \{[^}]*animation-duration: \.7s !important;[^}]*animation-iteration-count: infinite !important;/);
+  assert.doesNotMatch(styleSources.shell, /h3ps-guide-menu a:hover[^}]*rgba\(255,\s*255,\s*255/);
+  assert.doesNotMatch(styleSources.models, /h3ps-direct-advanced > summary:hover[^}]*rgba\(255,\s*255,\s*255/);
+  assert.doesNotMatch(styleSources.providers, /h3ps-runtime-menu button:hover[^}]*rgba\(255,\s*255,\s*255/);
+  assert.doesNotMatch(styleSources.overlays, /h3ps-model-setup-row:hover[^}]*rgba\(255,\s*255,\s*255/);
+  assert.match(styleSources.media, /\.h3ps-asset, \.h3ps-add-asset \{[^}]*height:\s*150px;/);
+  assert.doesNotMatch(stylesSource, /\.is-large-text|text-large\.css|zoom:/);
+  assert.doesNotMatch(styleSources["themes/dark"] + styleSources["themes/light"], /interface-size|interface-scale/);
+});
+
+test("interface maintenance guard keeps readable font sizes on semantic tokens", () => {
+  const violations = componentStyleNames.flatMap((name) => fixedFontSizeViolations(styleSources[name].replaceAll("\r", "")));
+  assert.deepEqual(violations, [], "ordinary readable UI font sizes should use semantic tokens");
+});
+
+test("theme and interface size preferences remain independent at both endpoints", () => {
+  for (const theme of ["dark", "light"]) {
+    for (const interfaceSize of ["100", "125"]) {
+      const state = createStudioState({
+        sessionId: `${theme}-${interfaceSize}`,
+        storage: memoryStorage({
+          [USER_PREFERENCES_STORAGE_KEY]: JSON.stringify({ version: 1, theme, interface_size: interfaceSize }),
+        }),
+      });
+      assert.equal(state.theme, theme);
+      assert.equal(state.interfaceSize, interfaceSize);
+    }
+  }
+});
+test("the current launcher replaces stale duplicate extension launchers", () => {
+  assert.match(mainSource, /const LAUNCHER_SCHEMA_VERSION = "2"/);
+  assert.match(mainSource, /existingLauncher\?\.dataset\.h3psLauncherVersion === LAUNCHER_SCHEMA_VERSION/);
+  assert.match(mainSource, /existingLauncher\?\.remove\(\)/);
+  assert.match(mainSource, /launcher\.dataset\.h3psLauncherVersion = LAUNCHER_SCHEMA_VERSION/);
+});
+
+test("workbench exposes responsive stacking and layered keyboard navigation", () => {
+  assert.match(styleSources.responsive, /@media \(max-width: 920px\)[\s\S]+\.h3ps-workspace \{[\s\S]+grid-template-columns: 1fr;[\s\S]+overflow-y: auto;/);
+  assert.match(styleSources.shell, /\.h3ps-modal > \* \{ min-width: 0; \}/);
+  assert.match(styleSources.responsive, /@media \(max-width: 920px\)[\s\S]+\.h3ps-header \{ flex-wrap: wrap; \}/);
+  assert.match(styleSources.responsive, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(mainSource, /aria-expanded="false" data-guide-toggle/);
+  assert.doesNotMatch(mainSource, /role="(?:menu|menuitem|listbox|option)"|aria-haspopup="menu"/);
+  assert.match(aspectRatioMarkup(()=>""), /class="h3ps-choice-menu h3ps-aspect-menu"[^>]*role="group"/);
+  assert.match(aspectRatioMarkup(()=>""), /aria-pressed="false"\s+data-aspect="16:9"/);
+  assert.match(mainSource, /role="status" aria-live="polite" aria-atomic="true" data-status/);
+  assert.match(mainSource, /if \(event\.key === "Tab"\)[\s\S]{0,1000}focusable/);
+});
+
+test("runtime pickers and the verified-model dialog keep keyboard state in sync", () => {
+  assert.match(settingsSource, /aria-haspopup="true" aria-expanded="false" data-runtime-toggle="context"/);
+  assert.match(settingsSource, /aria-haspopup="true" aria-expanded="false" data-runtime-toggle="reasoning"/);
+  assert.match(mainSource, /function setRuntimeMenuOpen\(name, open, restoreFocus = false\)/);
+  assert.match(mainSource, /else if \(runtimeMenu\) setRuntimeMenuOpen\(runtimeMenu\.dataset\.runtimeMenu, false, true\)/);
+  assert.match(mainSource, /data-other-models-backdrop[^>]*hidden/);
+  assert.match(mainSource, /role="dialog" aria-label="Other verified models"/);
+  assert.match(styleSources.overlays, /\.h3ps-other-models-backdrop\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*119;/);
+  assert.doesNotMatch(styleSources.overlays, /100vmax/);
+});
+
+test("focus styling stays visible for controls without outlining the dialog shell", () => {
+  assert.match(styleSources.foundation, /\.h3ps-root \.h3ps-modal:focus,[\s\S]{0,80}\.h3ps-root \.h3ps-modal:focus-visible\s*\{\s*outline:\s*none !important;/);
+  assert.match(styleSources.foundation, /\.h3ps-floating-launcher:focus-visible\s*\{[^}]*outline:\s*3px solid var\(--h3ps-launcher-focus\) !important/);
+  assert.doesNotMatch(styleSources.settings, /\.h3ps-provider-selector > button:focus-visible\s*\{[^}]*outline:\s*0/);
+  assert.match(styleSources["themes/dark"], /\.h3ps-root\s*\{[\s\S]*color-scheme:\s*dark;/);
+  assert.doesNotMatch(styleSources["themes/dark"], /:root\s*\{[^}]*color-scheme:/);
 });
 
 test("fullscreen reuses the studio root and persists its UI state", () => {
@@ -1073,8 +1668,7 @@ test("fullscreen reuses the studio root and persists its UI state", () => {
   assert.match(mainSource, /setAttribute\("aria-pressed", String\(studio\.fullscreen\)\)/);
   assert.match(mainSource, /if \(studio\.fullscreen\) setFullscreen\(false\)/);
   assert.match(mainSource, /saveUserPreferences\(localStorage, studio\)/);
-  assert.match(mainSource, /current\.root\.classList\.add\("is-open"\)[\s\S]{0,220}requestAnimationFrame\(updateBriefLayout\)/);
-  assert.match(mainSource, /const fullscreen = studio\.fullscreen && studio\.root\.classList\.contains\("is-open"\)/);
+  assert.match(mainSource, /fitTextarea\(brief, minimumHeight, 2\)/);
   assert.match(stylesSource, /\.h3ps-root\.is-fullscreen \.h3ps-brief textarea \{ max-height: none; \}/);
 });
 
@@ -1083,4 +1677,45 @@ test("prompt refinement keeps actions above a vertically resizable editor", () =
   assert.match(mainSource, /data-refine-helper[\s\S]{0,160}data-refine-media-note/);
   assert.doesNotMatch(mainSource, /refine_height|refineHeight/);
   assert.match(stylesSource, /\.h3ps-refine\[data-refine-panel\] textarea \{[^}]*min-height: 72px;[^}]*resize: vertical;/);
+});
+
+test("refined media UI has neutral actions, no dead preview flow or reorder thumbnail ghost",()=>{
+  assert.match(splitMenuMarkup(()=>"",{label:"Actions",primary:"data-actions-menu-toggle",toggle:"data-clear-menu-toggle",menu:"data-clear-menu",contents:"",ariaLabel:"Media actions"}),/data-actions-menu-toggle[^>]*>Actions/);
+  assert.match(mainSource,/splitMenuMarkup\(icon, \{label: "Actions"/);
+  assert.doesNotMatch(mainSource,/h3ps-compose-button|openVideoPreview|openImagePreview|resampleCurrentVideo|h3ps-drag-ghost/);
+  assert.match(mainSource,/ghost.width = ghost.height = 1/);
+  assert.match(mainSource,/setDragImage\(ghost, 0, 0\)/);
+  assert.match(mainSource,/dismissOnWorkspaceClick:true/);
+  assert.doesNotMatch(mainSource,/toast.onclick|options.persistent/);
+  assert.match(mainSource,/!event.target.closest\("\[data-h3ps-toast\]"\)/);
+  const fields=new Map(),classes=new Set(),timers=[];
+  const toast={classList:{contains:c=>classes.has(c),add:c=>classes.add(c),toggle:(c,on)=>on?classes.add(c):classes.delete(c)},querySelector(selector){
+    if(!fields.has(selector))fields.set(selector,{querySelector:()=>({})});
+    return fields.get(selector);
+  }};
+  const studio={root:{querySelector:()=>toast}};
+  let dismissed=0;
+  const show=mainSource.slice(mainSource.indexOf('function showToast('),mainSource.indexOf('function defaultModeDraft('));
+  new Function('studio','hideToast','setTimeout','clearTimeout',show+';showToast("Trim required","Keep this notice",null,null,{dismissOnWorkspaceClick:true});')(studio,()=>dismissed++,(fn,ms)=>timers.push({fn,ms}),()=>{});
+  assert.equal(timers.length,1);assert.equal(timers[0].ms,0);timers[0].fn();
+  assert.equal(studio.toastDismissOnWorkspaceClick,true);
+  const rule=mainSource.match(/if \(studio.toastDismissOnWorkspaceClick && !event.target.closest\("\[data-h3ps-toast\]"\)\) hideToast\(\);/)[0];
+  const click=new Function('studio','event','hideToast',rule);
+  click(studio,{target:{closest:()=>toast}},()=>dismissed++);assert.equal(dismissed,0);
+  click(studio,{target:{closest:()=>null}},()=>dismissed++);assert.equal(dismissed,1);
+});
+
+test("startup generation state has no legacy preview dependency",()=>{
+  assert.doesNotMatch(mainSource,/setSheetUpdating|resampleCurrentVideo|openVideoPreview/);
+  const start=mainSource.indexOf('function setGenerationState('),end=mainSource.indexOf('function updatePromptResidency(',start);
+  const noop=()=>{},node={querySelector:()=>node,querySelectorAll:()=>[],classList:{toggle:noop},innerHTML:''};
+  const studio={root:node,mode:'Reference'};
+  new Function('studio','icon','syncModeAvailability','renderMedia','syncLifecycleActions','HOST_CAPABILITIES','generationButtonMarkup',mainSource.slice(start,end)+';setGenerationState("idle","","");')(studio,noop,noop,noop,noop,{comfyMemory:true},generationButtonMarkup);
+});
+
+test("only confirmed Writer ownership makes unknown router state a release target",async()=>{
+  const status={prompt_residency:{external:{targets:[{model_id:'old',state:'unknown',writer_owned:false},{model_id:'other',state:'loaded',writer_owned:false}]}}};
+  assert.deepEqual(await unloadWriterModels({getStatus:async()=>status,unloadModel:async()=>assert.fail('no confirmed Writer residency')}),[]);
+  status.prompt_residency.external.targets[0].writer_owned=true;
+  assert.deepEqual(writerResidencyTargets(status),[{family:'external',model_id:'old'}]);
 });

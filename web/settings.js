@@ -64,6 +64,7 @@ export function settingsMarkup(icon) {
             </div>
             <p class="h3ps-installed-model-source" data-model-source-label>Local GGUF · llama-cpp-python</p>
             <div data-direct-model-status></div>
+            <div data-direct-projector></div>
             <div class="h3ps-model-utilities">
               <div data-model-scan-slot></div>
               <div data-verified-models-slot></div>
@@ -86,16 +87,17 @@ export function settingsMarkup(icon) {
         </section>
 
         <section class="h3ps-settings-card h3ps-runtime-settings">
-          <header><span><small>Runtime</small><strong>Context</strong></span></header>
+          <header><span><small>Runtime</small></span></header>
           <div class="h3ps-runtime-settings-grid">
-            <div class="h3ps-runtime-control"><span>Context</span><span class="h3ps-runtime-picker"><button type="button" data-runtime-toggle="context"><b data-runtime-label="context">Auto</b>${icon("chevron", 12)}</button><span class="h3ps-runtime-menu" data-runtime-menu="context" hidden><button type="button" data-runtime-option="context" data-value="auto">Auto</button><button type="button" data-runtime-option="context" data-value="low">8K</button><button type="button" data-runtime-option="context" data-value="standard">16K</button><button type="button" data-runtime-option="context" data-value="extended">24K</button><button type="button" data-runtime-option="context" data-value="large">32K</button><button type="button" data-runtime-option="context" data-value="maximum">48K</button><button type="button" data-runtime-option="context" data-value="custom">Custom</button></span></span><label class="h3ps-runtime-custom" data-custom-context hidden><input type="number" min="1024" step="1" inputmode="numeric" placeholder="Enter tokens" data-custom-context-input><span>tokens</span></label></div>
+            <label class="h3ps-runtime-control" data-ollama-context hidden><span>Context (tokens)</span><span class="h3ps-runtime-custom"><input type="number" min="1024" step="1" inputmode="numeric" placeholder="Auto" data-ollama-context-input></span></label>
+            <div class="h3ps-runtime-control"><span>Context</span><span class="h3ps-runtime-picker"><button type="button" aria-haspopup="true" aria-expanded="false" data-runtime-toggle="context"><b data-runtime-label="context">Auto</b>${icon("chevron", 12)}</button><span class="h3ps-runtime-menu" data-runtime-menu="context" hidden><button type="button" data-runtime-option="context" data-value="auto">Auto</button><button type="button" data-runtime-option="context" data-value="low">8K</button><button type="button" data-runtime-option="context" data-value="standard">16K</button><button type="button" data-runtime-option="context" data-value="extended">24K</button><button type="button" data-runtime-option="context" data-value="large">32K</button><button type="button" data-runtime-option="context" data-value="maximum">48K</button><button type="button" data-runtime-option="context" data-value="custom">Custom</button></span></span><label class="h3ps-runtime-custom" data-custom-context hidden><input type="number" min="1024" step="1" inputmode="numeric" placeholder="Enter tokens" data-custom-context-input><span>tokens</span></label></div>
           </div>
           <details class="h3ps-direct-advanced" data-direct-runtime-advanced>
             <summary><strong>Advanced settings</strong><em data-direct-advanced-summary>Auto</em>${icon("chevron", 12)}</summary>
             <div class="h3ps-direct-advanced-body">
-              <div class="h3ps-runtime-control"><span>KV cache</span><span class="h3ps-runtime-picker"><button type="button" data-runtime-toggle="kv"><b data-runtime-label="kv">Auto</b>${icon("chevron", 12)}</button><span class="h3ps-runtime-menu" data-runtime-menu="kv" hidden><button type="button" data-runtime-option="kv" data-value="auto">Auto</button><button type="button" data-runtime-option="kv" data-value="q8">Q8</button><button type="button" data-runtime-option="kv" data-value="f16">F16</button></span></span></div>
-              <div class="h3ps-runtime-control"><span>Generation budget</span><span class="h3ps-runtime-picker"><button type="button" data-runtime-toggle="budget"><b data-runtime-label="budget">Auto</b>${icon("chevron", 12)}</button><span class="h3ps-runtime-menu" data-runtime-menu="budget" hidden><button type="button" data-runtime-option="budget" data-value="auto">Auto</button><button type="button" data-runtime-option="budget" data-value="2048">2K</button><button type="button" data-runtime-option="budget" data-value="4096">4K</button><button type="button" data-runtime-option="budget" data-value="8192">8K</button><button type="button" data-runtime-option="budget" data-value="custom">Custom</button></span></span><label class="h3ps-runtime-custom" data-custom-generation-budget hidden><input type="number" min="1" step="1" inputmode="numeric" placeholder="Enter tokens" data-custom-generation-budget-input><span>tokens</span></label></div>
-              <div class="h3ps-runtime-control" data-reasoning-effort-control hidden><span>Reasoning effort</span><span class="h3ps-runtime-picker"><button type="button" data-runtime-toggle="reasoning"><b data-runtime-label="reasoning">Auto</b>${icon("chevron", 12)}</button><span class="h3ps-runtime-menu" data-runtime-menu="reasoning" hidden></span></span></div>
+              <div class="h3ps-runtime-control"><span>KV cache</span><span class="h3ps-runtime-picker"><button type="button" aria-haspopup="true" aria-expanded="false" data-runtime-toggle="kv"><b data-runtime-label="kv">Auto</b>${icon("chevron", 12)}</button><span class="h3ps-runtime-menu" data-runtime-menu="kv" hidden><button type="button" data-runtime-option="kv" data-value="auto">Auto</button><button type="button" data-runtime-option="kv" data-value="q8">Q8</button><button type="button" data-runtime-option="kv" data-value="f16">F16</button></span></span></div>
+              <div class="h3ps-runtime-control"><span>Generation budget</span><span class="h3ps-runtime-picker"><button type="button" aria-haspopup="true" aria-expanded="false" data-runtime-toggle="budget"><b data-runtime-label="budget">Auto</b>${icon("chevron", 12)}</button><span class="h3ps-runtime-menu" data-runtime-menu="budget" hidden><button type="button" data-runtime-option="budget" data-value="auto">Auto</button><button type="button" data-runtime-option="budget" data-value="2048">2K</button><button type="button" data-runtime-option="budget" data-value="4096">4K</button><button type="button" data-runtime-option="budget" data-value="8192">8K</button><button type="button" data-runtime-option="budget" data-value="custom">Custom</button></span></span><label class="h3ps-runtime-custom" data-custom-generation-budget hidden><input type="number" min="1" step="1" inputmode="numeric" placeholder="Enter tokens" data-custom-generation-budget-input><span>tokens</span></label></div>
+              <div class="h3ps-runtime-control" data-reasoning-effort-control hidden><span>Reasoning effort</span><span class="h3ps-runtime-picker"><button type="button" aria-haspopup="true" aria-expanded="false" data-runtime-toggle="reasoning"><b data-runtime-label="reasoning">Auto</b>${icon("chevron", 12)}</button><span class="h3ps-runtime-menu" data-runtime-menu="reasoning" hidden></span></span></div>
             </div>
           </details>
           <p data-runtime-management>Direct GGUF runtime settings are applied to the next request.</p>
@@ -120,6 +122,11 @@ export function settingsMarkup(icon) {
           <div class="h3ps-draft-defaults-action" data-draft-defaults-action>
             <button type="button" data-restore-default-drafts>${icon("refresh", 13)}<span data-restore-default-drafts-label>Restore default drafts</span></button>
           </div>
+        </section>
+        <section class="h3ps-settings-card h3ps-additional-settings">
+          <header><span><small>Additional settings</small></span></header>
+          <label class="h3ps-toggle-control" data-launcher-settings hidden><input type="checkbox" data-hide-launcher><span></span>Hide H3 button</label>
+          <label class="h3ps-toggle-control" data-desktop-notifications-hint><input type="checkbox" data-desktop-notifications><span></span>Desktop notifications</label>
         </section>
       </div>
     </section>`;

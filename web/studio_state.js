@@ -7,6 +7,7 @@ export const DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434";
 export const API_PROVIDER_STORAGE_KEY = "h3ps-api-provider-v1";
 export const USER_PREFERENCES_STORAGE_KEY = "h3ps-preferences-v1";
 export const MODE_DRAFTS_STORAGE_KEY = "h3ps-mode-drafts-v1";
+export const INTERFACE_SIZES = ["100", "110", "120", "125"];
 
 const MODES = ["T2VA", "I2VA", "FL2VA", "L2VA", "Reference", "Music3"];
 const ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9"];
@@ -30,7 +31,7 @@ export function isTextOnlyDirectModel(model) {
 }
 
 export function isGenerationModeAvailable(model, mode) {
-  return !isTextOnlyDirectModel(model) || mode === "T2VA";
+  return !isTextOnlyDirectModel(model) || mode === "T2VA" || mode === "Music3";
 }
 
 export function isModeDraftDirty(mode, draft, defaults) {
@@ -48,17 +49,31 @@ export function resetModeDraft(drafts, mode) {
   return next;
 }
 
+export function clearPromptDraft(draft = {}) {
+  return { ...draft, brief: "", prompt: "" };
+}
+
+export function normalizeCustomFrameCount(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 2 && count <= 24 ? String(count) : null;
+}
+
+function normalizeModeDraft(mode, draft) {
+  if (!draft || typeof draft.brief !== "string" || typeof draft.prompt !== "string") return null;
+  const normalized = { brief: mode === "Music3" ? draft.brief.slice(0, 2000) : draft.brief, prompt: draft.prompt };
+  if (mode === "Music3") {
+    normalized.lyrics = typeof draft.lyrics === "string" ? draft.lyrics.slice(0, 4000) : "";
+  }
+  return normalized;
+}
+
 export function loadModeDrafts(storage = globalThis.localStorage) {
   try {
     const value = JSON.parse(storage?.getItem(MODE_DRAFTS_STORAGE_KEY) || "null");
     if (!value || value.version !== 1 || !value.drafts || typeof value.drafts !== "object") return {};
     return Object.fromEntries(DRAFT_MODES.flatMap((mode) => {
-      const draft = value.drafts[mode];
-      if (!draft || typeof draft.brief !== "string" || typeof draft.prompt !== "string") return [];
-      const briefLimit = mode === "Music3" ? 2000 : 8000;
-      const safeDraft = { brief: draft.brief.slice(0, briefLimit), prompt: draft.prompt.slice(0, 16000) };
-      if (mode === "Music3") safeDraft.lyrics = typeof draft.lyrics === "string" ? draft.lyrics.slice(0, 4000) : "";
-      return [[mode, safeDraft]];
+      const draft = normalizeModeDraft(mode, value.drafts[mode]);
+      return draft ? [[mode, draft]] : [];
     }));
   } catch {
     return {};
@@ -67,12 +82,8 @@ export function loadModeDrafts(storage = globalThis.localStorage) {
 
 export function saveModeDrafts(storage, drafts) {
   const safeDrafts = Object.fromEntries(DRAFT_MODES.flatMap((mode) => {
-    const draft = drafts?.[mode];
-    if (!draft || typeof draft.brief !== "string" || typeof draft.prompt !== "string") return [];
-    const briefLimit = mode === "Music3" ? 2000 : 8000;
-    const safeDraft = { brief: draft.brief.slice(0, briefLimit), prompt: draft.prompt.slice(0, 16000) };
-    if (mode === "Music3") safeDraft.lyrics = typeof draft.lyrics === "string" ? draft.lyrics.slice(0, 4000) : "";
-    return [[mode, safeDraft]];
+    const draft = normalizeModeDraft(mode, drafts?.[mode]);
+    return draft ? [[mode, draft]] : [];
   }));
   storage?.setItem(MODE_DRAFTS_STORAGE_KEY, JSON.stringify({ version: 1, drafts: safeDrafts }));
 }
@@ -93,9 +104,15 @@ export function loadUserPreferences(storage = globalThis.localStorage) {
       direct_kv_cache: KV_CACHES.includes(value.direct_kv_cache) ? value.direct_kv_cache : "auto",
       direct_generation_budget: GENERATION_BUDGETS.includes(value.direct_generation_budget) ? value.direct_generation_budget : "auto",
       direct_generation_budget_tokens: Number.isInteger(value.direct_generation_budget_tokens) && value.direct_generation_budget_tokens > 0 ? value.direct_generation_budget_tokens : null,
+      ollama_context_tokens: Number.isSafeInteger(value.ollama_context_tokens) && value.ollama_context_tokens > 0 ? value.ollama_context_tokens : null,
+      ollama_generation_budget: GENERATION_BUDGETS.includes(value.ollama_generation_budget) ? value.ollama_generation_budget : "auto",
+      ollama_generation_budget_tokens: Number.isInteger(value.ollama_generation_budget_tokens) && value.ollama_generation_budget_tokens > 0 ? value.ollama_generation_budget_tokens : null,
       direct_reasoning_effort: typeof value.direct_reasoning_effort === "string" && value.direct_reasoning_effort ? value.direct_reasoning_effort : "auto",
       music_lyrics_use_brief: value.music_lyrics_use_brief !== false,
       fullscreen: value.fullscreen === true,
+      vram_handoff: value.vram_handoff === true,
+      theme: value.theme === "light" ? "light" : "dark",
+      interface_size: INTERFACE_SIZES.includes(value.interface_size) ? value.interface_size : "100",
     };
   } catch {
     return null;
@@ -115,11 +132,33 @@ export function saveUserPreferences(storage, state) {
     direct_kv_cache: KV_CACHES.includes(state.directKvCache) ? state.directKvCache : "auto",
     direct_generation_budget: GENERATION_BUDGETS.includes(state.directGenerationBudget) ? state.directGenerationBudget : "auto",
     direct_generation_budget_tokens: Number.isInteger(state.directGenerationBudgetTokens) && state.directGenerationBudgetTokens > 0 ? state.directGenerationBudgetTokens : null,
+    ollama_context_tokens: state.ollamaContextTokens ?? null,
+    ollama_generation_budget: GENERATION_BUDGETS.includes(state.ollamaGenerationBudget) ? state.ollamaGenerationBudget : "auto",
+    ollama_generation_budget_tokens: Number.isInteger(state.ollamaGenerationBudgetTokens) && state.ollamaGenerationBudgetTokens > 0 ? state.ollamaGenerationBudgetTokens : null,
     direct_reasoning_effort: typeof state.directReasoningEffort === "string" && state.directReasoningEffort ? state.directReasoningEffort : "auto",
     music_lyrics_use_brief: state.musicLyricsUseBrief !== false,
     fullscreen: state.fullscreen === true,
+    vram_handoff: state.vramHandoff === true,
+    theme: state.theme === "light" ? "light" : "dark",
+    interface_size: INTERFACE_SIZES.includes(state.interfaceSize) ? state.interfaceSize : "100",
   };
   storage?.setItem(USER_PREFERENCES_STORAGE_KEY, JSON.stringify(safe));
+}
+
+export const API_SAMPLING_FIELDS = [
+  { name: "temperature", label: "Temperature", min: 0, max: 2, step: "any" },
+  { name: "top_p", label: "Top P", min: 0, max: 1, step: "any" },
+  { name: "top_k", label: "Top K", min: 0, step: "1" },
+  { name: "frequency_penalty", label: "Frequency penalty", min: -2, max: 2, step: "any" },
+  { name: "presence_penalty", label: "Presence penalty", min: -2, max: 2, step: "any" },
+];
+
+export function safeApiSampling(value, allowed = API_SAMPLING_FIELDS.map(({ name }) => name)) {
+  return Object.fromEntries(API_SAMPLING_FIELDS.filter(({ name, min, max }) => {
+    const number = value?.[name];
+    return allowed.includes(name) && typeof number === "number" && Number.isFinite(number)
+      && number >= min && (max == null || number <= max) && (name !== "top_k" || Number.isSafeInteger(number));
+  }).map(({ name }) => [name, value[name]]));
 }
 
 export function loadApiProviderConfig(storage = globalThis.localStorage) {
@@ -132,6 +171,7 @@ export function loadApiProviderConfig(storage = globalThis.localStorage) {
       model_id: typeof value.model_id === "string" ? value.model_id : "",
       gemini_reasoning_effort: ["minimal", "low", "medium", "high"].includes(value.gemini_reasoning_effort) ? value.gemini_reasoning_effort : "minimal",
       custom_images: value.custom_images === true,
+      sampling: safeApiSampling(value.sampling),
       custom_context_tokens: Number.isInteger(value.custom_context_tokens) ? value.custom_context_tokens : null,
     };
   } catch {
@@ -150,6 +190,7 @@ export function saveApiProviderConfig(storage, config) {
     model_id: String(config.model_id || ""),
     gemini_reasoning_effort: ["minimal", "low", "medium", "high"].includes(config.gemini_reasoning_effort) ? config.gemini_reasoning_effort : "minimal",
     custom_images: config.custom_images === true,
+    sampling: safeApiSampling(config.sampling),
     custom_context_tokens: Number.isInteger(config.custom_context_tokens) ? config.custom_context_tokens : null,
   };
   storage?.setItem(API_PROVIDER_STORAGE_KEY, JSON.stringify(safe));
@@ -306,6 +347,7 @@ export function restoredModelAfterDiscovery(state) {
 
 function sharedInferencePayload(state) {
   const directRuntime = state.selectedModel?.family === "gguf";
+  const customOllamaContext = state.selectedModel?.family === "ollama" && state.ollamaContextTokens != null;
   const thinking = state.selectedModel?.family === "external" ? false : state.thinking;
   const generationBudgetMode = state.generationBudget || "auto";
   const generationBudget = generationBudgetMode === "custom"
@@ -315,17 +357,22 @@ function sharedInferencePayload(state) {
     session_id: state.sessionId,
     mode: state.mode,
     model_id: state.selectedModel?.id,
+    ...(directRuntime && state.selectedModel.selected_projector ? { gguf_projector: state.selectedModel.selected_projector } : {}),
     external_server: selectedExternalServer(state),
     ollama_model: selectedOllamaModel(state),
     ollama_host: selectedOllamaHost(state),
     api_provider: selectedApiProvider(state),
+    ...(state.selectedModel?.family === "api" ? {
+      api_sampling: safeApiSampling(state.apiProviderConfig?.sampling, state.selectedModel.sampling_parameters || []),
+    } : {}),
     thinking,
-    context_profile: directRuntime ? state.contextProfile : "auto",
+    context_profile: directRuntime ? state.contextProfile : customOllamaContext ? "custom" : "auto",
+    ...(customOllamaContext ? { context_tokens: state.ollamaContextTokens } : {}),
     kv_cache: directRuntime ? state.kvCache : "auto",
     ...(directRuntime ? {
       context_tokens: state.contextProfile === "custom" ? state.contextTokens : null,
-      generation_budget: generationBudget,
     } : {}),
+    ...(["gguf", "ollama"].includes(state.selectedModel?.family) ? { generation_budget: generationBudget } : {}),
     ...(directRuntime && thinking ? { reasoning_effort: state.reasoningEffort || "auto" } : {}),
     system_prompt_override: currentSystemPromptOverride(state),
     unload_after: !state.keepModelLoaded,
@@ -333,34 +380,12 @@ function sharedInferencePayload(state) {
 }
 
 export function buildGeneratePayload(state, { creativeBrief, lyrics = "", seed }) {
-  const directRuntime = state.selectedModel?.family === "gguf";
-  const thinking = state.selectedModel?.family === "external" ? false : state.thinking;
-  const generationBudgetMode = state.generationBudget || "auto";
-  const generationBudget = generationBudgetMode === "custom"
-    ? (state.generationBudgetTokens ?? 0)
-    : generationBudgetMode === "auto" ? null : Number(generationBudgetMode);
   const payload = {
-    session_id: state.sessionId,
-    mode: state.mode,
+    ...sharedInferencePayload(state),
     duration_seconds: state.durationSeconds,
     aspect_ratio: state.aspectRatio,
     creative_brief: creativeBrief,
-    model_id: state.selectedModel?.id,
-    external_server: selectedExternalServer(state),
-    ollama_model: selectedOllamaModel(state),
-    ollama_host: selectedOllamaHost(state),
-    api_provider: selectedApiProvider(state),
-    thinking,
-    context_profile: directRuntime ? state.contextProfile : "auto",
-    kv_cache: directRuntime ? state.kvCache : "auto",
-    ...(directRuntime ? {
-      context_tokens: state.contextProfile === "custom" ? state.contextTokens : null,
-      generation_budget: generationBudget,
-    } : {}),
-    ...(directRuntime && thinking ? { reasoning_effort: state.reasoningEffort || "auto" } : {}),
-    system_prompt_override: currentSystemPromptOverride(state),
     seed,
-    unload_after: !state.keepModelLoaded,
   };
   if (state.mode === "Music3") payload.lyrics = lyrics;
   return payload;
@@ -416,6 +441,7 @@ export function createStudioState({ sessionId, storage = globalThis.localStorage
     reasoningEffort: "auto",
     thinking: false,
     keepModelLoaded: false,
+    vramHandoff: preferences?.vram_handoff === true,
     settingsProvider: preferences?.active_provider || "ollama",
     preferencesRestoring: true,
     preferredProvider: preferences?.active_provider || "ollama",
@@ -423,11 +449,16 @@ export function createStudioState({ sessionId, storage = globalThis.localStorage
     directContextProfile: preferences?.direct_context_profile || "auto",
     directContextTokens: preferences?.direct_context_tokens || null,
     directKvCache: preferences?.direct_kv_cache || "auto",
+    ollamaContextTokens: preferences?.ollama_context_tokens ?? null,
+    ollamaGenerationBudget: preferences?.ollama_generation_budget || "auto",
+    ollamaGenerationBudgetTokens: preferences?.ollama_generation_budget_tokens || null,
     directGenerationBudget: preferences?.direct_generation_budget || "auto",
     directGenerationBudgetTokens: preferences?.direct_generation_budget_tokens || null,
     directReasoningEffort: preferences?.direct_reasoning_effort || "auto",
     musicLyricsUseBrief: preferences?.music_lyrics_use_brief !== false,
     fullscreen: preferences?.fullscreen === true,
+    theme: preferences?.theme === "light" ? "light" : "dark",
+    interfaceSize: INTERFACE_SIZES.includes(preferences?.interface_size) ? preferences.interface_size : "100",
     settingsPromptProfile: "standard",
     musicSystemPromptProfile: "music3",
     musicSystemPromptExpanded: false,
@@ -435,8 +466,10 @@ export function createStudioState({ sessionId, storage = globalThis.localStorage
     promptResidency: { direct: null, ollama: [] },
     activeRequestFamily: null,
     activeRequestModelId: null,
+    activeRequestOllamaHost: null,
     requestBusy: false,
     comfyVramReleaseInFlight: false,
+    vramHandoffInFlight: false,
     lyricsRequestBusy: false,
     toastTimer: null,
     statusTimer: null,
@@ -444,7 +477,6 @@ export function createStudioState({ sessionId, storage = globalThis.localStorage
     generationDotCount: 0,
     sessionId,
     assets: [],
-    previewAssetId: null,
     audioSupported: false,
     models: [],
     modelSetup: [],
