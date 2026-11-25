@@ -140,7 +140,7 @@ def _pair_projector(
     if len(compatible) == 1:
         return compatible[0], "compatible", None
     if len(compatible) > 1:
-        return None, "ambiguous", "Multiple compatible vision projectors share this folder. Keep only the intended projector beside the model."
+        return None, "ambiguous", "Multiple compatible vision projectors share this folder. Move each model and its intended projector into its own subfolder."
     return None, "incompatible", "The vision projector files in this folder are not metadata-compatible with this model."
 
 
@@ -150,6 +150,7 @@ def _model_candidate(
     *,
     runtime_available: bool,
     runtime_version: str | None,
+    selected_projector: Path | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     model_id = str(model_path.resolve())
     metadata, metadata_error = _metadata_result(model_path)
@@ -185,11 +186,11 @@ def _model_candidate(
         setup_message = f"The installed llama-cpp-python {runtime_version or 'version'} does not support the {adapter.id} Direct adapter."
 
     if metadata:
-        projector, vision_status, pairing_message = _pair_projector(metadata, sibling_projectors)
+        projector, vision_status, pairing_message = _pair_projector(metadata, [selected_projector] if selected_projector else sibling_projectors)
     else:
         projector, vision_status, pairing_message = None, "incompatible", "Vision is disabled because the model metadata could not be read."
     pairing_issue = f"{model_path}: {pairing_message}" if pairing_message else None
-    text_fallback = " T2VA remains available." if not missing_dependencies else ""
+    text_fallback = " T2VA and Music3 remain available." if not missing_dependencies else ""
     capability_message = None if vision_status == "compatible" else f"Vision unavailable: {pairing_message}{text_fallback}"
 
     configured = _configured_models().get(model_path.name, {}) if metadata and architecture_recognized else {}
@@ -286,6 +287,10 @@ def _model_candidate(
             "reasoning_effort": bool(template_controls["reasoning_effort"]),
             "vision_projector": projector is not None,
         },
+        "selected_projector": str(selected_projector) if selected_projector else None,
+        "projector_candidates": [str(path.resolve()) for path in sibling_projectors
+                                 if metadata and _metadata_result(path)[0]
+                                 and projector_is_compatible(adapter, metadata, _metadata_result(path)[0])],
         "projector_metadata": {
             key: value
             for key, value in ((_metadata_result(projector)[0] if projector else {}) or {}).items()
@@ -295,12 +300,28 @@ def _model_candidate(
     }, pairing_issue
 
 
+def _model_roots() -> list[Path]:
+    roots = []
+    seen = set()
+    for category in ("LLM", "llm"):
+        try:
+            paths = folder_paths.get_folder_paths(category)
+        except KeyError:
+            continue
+        for value in paths:
+            root = Path(value).resolve()
+            if root not in seen:
+                seen.add(root)
+                roots.append(root)
+    return roots
+
+
 def discover_models_with_diagnostics() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     scanned_roots: list[dict[str, Any]] = []
 
-    for root_name in folder_paths.get_folder_paths("LLM"):
+    for root_name in _model_roots():
         root = Path(root_name)
         root_diagnostics: dict[str, Any] = {
             "path": str(root),
@@ -400,7 +421,7 @@ def find_model(model_id: str) -> dict[str, Any] | None:
         return None
 
     roots = []
-    for root_name in folder_paths.get_folder_paths("LLM"):
+    for root_name in _model_roots():
         try:
             roots.append(Path(root_name).resolve(strict=True))
         except (OSError, RuntimeError):
@@ -419,3 +440,22 @@ def find_model(model_id: str) -> dict[str, Any] | None:
         _runtime_version() if runtime_available else None,
     )
     return copy.deepcopy(candidate)
+
+
+def resolve_projector(model_id: str, projector_path: str) -> dict[str, Any] | None:
+    """Explicit selection only among current, compatible siblings of a registered model."""
+    model = find_model(model_id)
+    if not model or not isinstance(projector_path, str):
+        return None
+    try:
+        selected = Path(projector_path).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if str(selected) not in model["projector_candidates"]:
+        return None
+    candidate, _issue = _model_candidate(
+        Path(model["path"]), [Path(p) for p in model["projector_candidates"]],
+        runtime_available=importlib.util.find_spec("llama_cpp") is not None,
+        runtime_version=_runtime_version(), selected_projector=selected,
+    )
+    return candidate

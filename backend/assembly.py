@@ -50,9 +50,20 @@ def _effective_system_prompt(body: dict[str, Any], mode: str) -> tuple[str, bool
         raise AssemblyError(error.code, error.message) from error
 
 
+def _validate_missing_media(text: str, field_label: str) -> None:
+    missing = re.search(r"<Missing (?:Picture|Video|Audio) [1-9]\d*>", text)
+    if missing:
+        raise AssemblyError(
+            "REFERENCE_NOT_FOUND",
+            f"{missing[0]} refers to removed or unavailable media. Replace or remove this tag in the {field_label}.",
+            {"reference": missing[0]},
+        )
+
+
 def _validate_reference_tags(text: str, manifest: dict[str, Any], mode: str, field_label: str) -> None:
     if mode != "Reference":
         return
+    _validate_missing_media(text, field_label)
     available = {asset["reference"] for asset in manifest["assets"]}
     canonical_tags = canonical_reference_tags(text)
     missing = sorted(canonical_tags - available)
@@ -65,7 +76,7 @@ def _validate_reference_tags(text: str, manifest: dict[str, Any], mode: str, fie
         )
 
 
-def _validated_generation_context(source: dict[str, Any], *, long_text: bool = False) -> tuple[float, str, str]:
+def _validated_generation_context(source: dict[str, Any]) -> tuple[float, str, str]:
     duration = source.get("duration_seconds")
     if not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration <= 0 or duration > 20:
         raise AssemblyError("INVALID_DURATION", "Duration must be between 1 and 20 seconds.")
@@ -73,8 +84,6 @@ def _validated_generation_context(source: dict[str, Any], *, long_text: bool = F
     if aspect_ratio not in ASPECT_RATIOS:
         raise AssemblyError("INVALID_ASPECT_RATIO", "The selected aspect ratio is not supported.")
     brief = _required_text(source, "creative_brief", "Creative brief")
-    if not long_text and len(brief) > 8000:
-        raise AssemblyError("BRIEF_TOO_LONG", "Creative brief cannot exceed 8,000 characters.")
     return duration, aspect_ratio, brief
 
 
@@ -185,8 +194,6 @@ def assemble_request(body: dict[str, Any]) -> dict[str, Any]:
         raise AssemblyError("INVALID_MODE", "The selected MiniMax mode is not supported.")
     system_prompt, system_prompt_custom = _effective_system_prompt(body, mode)
     brief = _required_text(body, "creative_brief", "Creative brief")
-    if not body.get("ollama_model") and len(brief) > 8000:
-        raise AssemblyError("BRIEF_TOO_LONG", "Creative brief cannot exceed 8,000 characters.")
 
     aspect_ratio = _required_text(body, "aspect_ratio", "Aspect ratio")
     if aspect_ratio not in ASPECT_RATIOS:
@@ -322,9 +329,11 @@ def assemble_refinement(
     if not manifest["valid"]:
         raise AssemblyError("INVALID_MEDIA_MANIFEST", "The media manifest is not valid.", manifest["violations"])
     context_source = cached_generation if cached_generation and cached_generation.get("mode") == mode else body
-    duration, aspect_ratio, creative_brief = _validated_generation_context(context_source, long_text=long_text)
+    duration, aspect_ratio, creative_brief = _validated_generation_context(context_source)
     _validate_reference_tags(creative_brief, manifest, mode, "Creative Brief")
     _validate_reference_tags(instruction, manifest, mode, "Revision instruction")
+    if mode == "Reference":
+        _validate_missing_media(current_prompt, "Current prompt")
     references = "\n".join(_media_line(asset) for asset in manifest["assets"]) or "None"
     guide = guide_for_mode(mode)
     user_content = (

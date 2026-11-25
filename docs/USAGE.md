@@ -11,9 +11,11 @@
 7. Select **Generate prompt**.
 8. Review or edit the generated prompt, then select **Copy prompt** and paste it into your H3 workflow.
 
-Prompt Writer creates text. It does not add nodes, modify the graph, or queue a video workflow.
+Generating a prompt does not change or queue your workflow. To add media loaders, use the separate **Media panel** described below.
 
 Use the fullscreen button in the Writer header when you want the workspace to fill the browser. Press Escape to leave fullscreen.
+
+The sun/moon button switches between Dark and Light. The **Aa** button adjusts **Interface Size** from 100% to 125%. These preferences are saved and affect only Prompt Writer, not ComfyUI or exported media.
 
 ![Reference mode with a generated prompt](assets/v0.3/reference-workspace.png)
 
@@ -28,6 +30,72 @@ Use the fullscreen button in the Writer header when you want the workspace to fi
 | Reference | Up to 9 images, 3 videos, and 3 audio files; 12 files total | Each active file can provide a specific subject, setting, motion, camera, style, or sound role |
 
 Duration and aspect ratio become part of the request. The generated text remains editable before you copy it.
+
+### Save and load text drafts
+
+Use **Actions > Save text draft** or **Load text draft** to save or open a JSON file for Single H3 or Sequence. Drafts include the brief, prompts, writing instructions, duration and aspect ratio. Sequence also keeps chunk directions, output format and copy formatting. File names include the draft type and local date and time.
+
+Media files, model settings and credentials are not included. Loading replaces the target draft and clears its current media. Reattach the original files and check their labels before generating. File names and Sequence assignments are listed in Technical details as a reminder. This is a text backup, not a complete project archive.
+
+## Sequence
+
+Choose **Sequence** to write several H3 prompts from one Creative Brief. Add chunks and set their durations, from 1 to 15 seconds each. **New chunk duration** applies to the next added chunk. On first use, a short example fills Creative Brief while chunk prompts stay empty. Edit or clear it; saved edits and empty briefs stay as you left them. The sequence keeps its own draft. It does not join videos, connect a workflow, or assume how you will use the chunks.
+
+For a multi-chunk operation, Writer makes one internal semantic planning call to allocate development and intended ending states for the requested chunks. It then makes one generation call per requested chunk, in order. A sequence with only one chunk skips planning. Official output is a full standalone MiniMax H3 prompt, with its own scene description and local `[Shot 1]` numbering. Compact output is a standalone descriptive video prompt in natural language.
+
+The brief and explicit instructions govern intent. Current media and visible prompts, including manual edits, supply scene evidence. The planner reads your original brief, Chunk Direction and objective chunk boundaries. It interprets timing in your own words, without an application-side language parser. The temporary plan distributes events, speech, atmosphere, or sustained activity. It does not require a new action at every boundary or invent a conclusion for an open-ended brief. Each writer continues the actual preceding ending and considers any following accepted opening. Planning is rebuilt for each operation. **Sequence Instructions** lets you adjust shared writing directions. No camera moves or cuts are requested unless you ask for them; added behavior stays modest and consistent with the brief.
+
+### Output format
+
+Open **Sequence Instructions** and choose **Official** or **Compact** below the textarea. Official is the default and follows the full Base/Reference structure. Compact receives its own writing contract, not the official Base/Reference guide. It writes a standalone natural-language description, then two required fields:
+
+```text
+A complete description of the scene and action.
+
+overall_soundscape:
+Brief, scene-grounded audible sounds.
+
+non_diegetic_music:
+N/A
+```
+
+Sound stays modest and natural. When you request music, the music field briefly describes it. Without a music request, or when you ask for no music, it stays `N/A`. Useful media literals and local timing remain available.
+
+Both formats share the same brief, media, planner, Chunk Direction, continuity and Generate/Refine behavior. Switching format affects future generations. It does not convert existing prompts or overwrite custom instructions. Restore default resets instructions for the selected format. Compact checks its description, sound fields, media labels and local timing. Missing sound content is not invented by format correction. A format correction cannot rewrite the scene.
+
+### Media and guides
+
+| Assignment | Scope |
+| --- | --- |
+| First | Opening frame of the first chunk only |
+| Last | Closing frame of the last chunk only |
+| Reference | Shared references, with additions or exclusions for individual chunks |
+
+In Official format, Writer selects the guide for each chunk's effective media. With references, it uses the official Reference guide. Otherwise it uses the official Base guide: T2VA with no frames, I2VA with First, L2VA with Last, or FL2VA with both. First and Last can also accompany references. Uploading a file does not assign it automatically. The Reference summary starts with an official task prefix. For example, `[keyframe completion + reference generation]` is correct when a frame anchor and an appearance reference are supplied. Keep this prefix.
+
+In the shared brief, use **first frame**, **last frame**, and **reference 1**. In a chunk field, use the tags shown for that chunk. Tags such as `<Picture 1>` are local to each request and can refer to different files in different chunks. The planner reads text and assignment roles; prepared images and video contact sheets go to the chunk writer. Describe audio roles in text, as in Single mode.
+
+### Timing and edits
+
+Chunk ranges show global sequence time. Prompt timestamps start at zero within each chunk. For example, an event at global 25 seconds belongs at local `00:05.000` in a chunk covering 20–30 seconds. Write global event timing in the shared brief and local directions in **Chunk Direction**.
+
+**Chunk Direction** affects that chunk when generated or refined. **Generate sequence** fills empty chunks and retries prompts that need attention. Other prompts stay unchanged. Once all chunks are usable, **Regenerate sequence** rewrites them all. Use a chunk's **Generate** or **Regenerate** to write only that chunk. **Refine** uses its current edited prompt, revision instruction, shared brief, directions, effective media, and existing neighbors. It rewrites only the selected chunk. Editing an earlier chunk does not automatically rewrite later chunks.
+
+### Reading and copying
+
+Edit prompts in place or use **Reader** for a compact view. Official uses Single mode colors for H3 sections, subjects, media tags, shots, timing, and dialogue. Compact highlights `<Picture N>`, `overall_soundscape:` and `non_diegetic_music:`. Highlighting is a reading aid, not a validation result; copied text stays plain. A chunk's copy button copies its prompt. **Copy All** copies nonempty prompts in sequence order. If a chunk needs attention, fix it first; individual Copy remains available. Reader keeps the same attention indicator. **Default** separates them with blank lines. **Custom** applies a chunk template and a separator without changing the saved prompts.
+
+Templates support `{prompt}`, `{index}`, `{start}`, `{end}`, and `{duration}`. Times are global seconds. Try **Divider**, **Time ranges**, **Numbered**, or **Chapters**. The separator field displays escapes such as `\n\n---\n\n` visibly; copying turns `\n`, `\r`, `\t`, and `\\` into their literal characters. This is template formatting, not a regular-expression engine.
+
+### Limits and failures
+
+Planning improves continuity but does not guarantee natural pacing or exact visual fidelity. Some models still stretch a short action across chunks. Review the boundary states, reference tags, and timing before using the prompts. Clear directions help when a brief provides too little action for the requested duration.
+
+A structurally invalid plan stops generation with an error. There is no fallback or hidden semantic repair. Lossless cleanup removes a complete outer Markdown fence and normalizes unambiguous local timestamp typos such as `05:000` to `00:05.000`. A value like `05:00` is normalized only when the chunk duration leaves one plausible in-range time, such as five seconds in a ten-second chunk. It never invents sections, moves events, or rewrites dialogue. Format-specific checks reject incomplete required content, invalid local shots or timestamps, unavailable media labels, and missing required frame anchors. It checks syntax and media contracts, not story quality.
+
+For Official image-only Reference inputs, Writer corrects impossible video/audio task labels from the assigned media roles. This changes only task metadata. Writer allows at most one format correction per chunk with the same writing contract and media. Compact correction can remove stray official headings while preserving description and sound content. It does not change the plan or intentionally rewrite scene content. Ambiguous timing and missing content are left for review.
+
+During generation, chunks show Queued, Generating, Checking, or Repairing. Targeted editors start empty and show each completed prompt immediately. Previous versions stay in Undo/Redo. Cancel stops further work and keeps completed chunks. A failed format check keeps the model output with a small orange attention icon. Hover, focus, or select it for an explanation and a suggested fix. Regenerate, Refine, or edit that prompt directly. Manual edits clear the warning from the previous model output. Runtime and planning errors remain visible until dismissed. Longer prompts, references, and planning context can exceed the model's context limit. See [Sequence troubleshooting](TROUBLESHOOTING.md#sequence-stops-or-repeats-an-action).
 
 ## Music 3
 
@@ -47,7 +115,7 @@ Music 3 keeps its own saved Music Brief, Lyrics, and edited caption. Open **Syst
 
 Write what should happen in ordinary language. You do not need to reproduce the official H3 prompt format. Writer builds that structure for you.
 
-Video Creative Briefs can contain up to 8,000 characters. Music Briefs keep their separate 2,000-character limit.
+Single and Sequence Creative Briefs have no character limit. The full request must still fit the model context, including guides, media, and room for the answer. Music Briefs keep their separate 2,000-character limit.
 
 A useful brief usually says:
 
@@ -97,13 +165,41 @@ Include a transcript when exact speech or lyrics matter. Writer preserves user-s
 
 ## Images and video
 
-Images are sent to the selected multimodal model in reference order. Reordering media renumbers tags within each type.
+Images are sent to the selected multimodal model in reference order. Reordering Reference media preserves each asset’s assigned tag. A temporarily ineligible asset reserves its tag until it becomes eligible again.
 
 In Reference mode, select **Replace** on an asset card or drop one new file on the card. The new file keeps the same position in the list. It can be a different media type, so check any Picture, Video, or Audio tags in your brief after replacing it. Dropping several files on a card adds them to the end of the list instead.
+
+Single Reference labels follow the current order of ready media within each type. Deleting or reordering media updates the labels and matching tags in the Single Brief, prompt, and Refine text. Same-type replacement keeps its slot. References to removed or unavailable media become tags such as `<Missing Picture 1>`; replace or remove them before Generate or Refine. Sequence keeps its separate chunk-local labels.
 
 For video, Writer prepares an ordered contact sheet. Open a video card to inspect **What the model sees** and choose the available frame-sampling options. The contact sheet still represents the same `<Video N>` reference; it does not create extra `<Picture N>` tags.
 
 Local providers and remote API providers use the prepared contact sheet instead of the original encoded video stream. API providers can receive the derived sheet, but not the original video bytes.
+
+## Media Editor
+
+Open a picture or video card to edit it. Crop pictures, trim or crop video, and inspect the applied result in **What the model sees**. For video, you can also download the current frame or add it as a new Picture.
+
+For a video with audio, select 2-15 seconds and use the **Extract audio** icon next to **Add current frame as Picture**. Writer downloads a WAV file and adds it as an Audio reference, keeping the video unchanged. This uses the current trim selection without requiring Apply. Connect the WAV separately in H3. Writer does not analyze its sound; describe its intended role in the Brief.
+
+Edits stay in the editor until you select **Apply**. **Reset edits** returns the draft to the original media; Apply saves that reset. Closing with unapplied changes lets you keep editing or discard the draft. The original file is preserved.
+
+Long clips can stay in Media with **Trim required**. Trim them to 2–15 seconds and Apply before using them as H3 Reference inputs.
+
+## Media Composer
+
+In Reference mode, open **Actions > Compose** to combine existing pictures and video contact sheets. Use Auto or a column layout, then move and resize items as needed. You can add captions and choose the canvas shape and output size.
+
+**Add as Picture** adds the collage as a new, independent Picture. You can also download or copy the PNG. Later changes to the source media do not update an existing collage.
+
+## Media panel
+
+Open **Media panel** from the Writer header or **Actions > Media panel**. It floats over the workflow without blocking the canvas. Drag its header to move it; the position is saved. Opening Writer temporarily hides the panel, and closing Writer brings it back.
+
+Drag media to empty canvas to create a Load Image, Load Video, or Load Audio node. Drop onto a compatible loader to replace its file without changing its connections. Supported targets are ComfyUI's **Load Image**, **Load Image (as Mask)**, **Load Video**, **Load Audio**, and Video Helper Suite's **Load Video (Upload)**. Other nodes are left unchanged.
+
+Each drop uses the original file or its latest Applied edit. Unapplied drafts and video contact sheets are not transferred. Media marked **Trim required** can still be transferred. Later Writer edits do not update existing loaders; drag again when you want the new version.
+
+Transferred files are stored in `ComfyUI/input/prompt-writer`. Reusing unchanged media reuses the file. If there is no media, Writer shows **Add media first**.
 
 ## Audio references
 
@@ -124,9 +220,11 @@ Every active picture and video is expected to be accounted for with its exact `<
 
 Use **Insert reference** beside **Refine** to add a current subject, picture, video, or audio tag at the caret in the Creative Brief, Generated Prompt, or Refine instruction.
 
-After generation, Writer checks the required format and exact media tags. A valid prompt is returned without being rewritten. If a visual reference tag is missing, Writer can make one correction using the same prepared media. If the correction does not pass the check, Writer keeps the original prompt and shows a warning instead of hiding the problem.
+In Single mode, Writer checks the required format and exact media tags after generation. A valid prompt is returned without being rewritten. If a visual reference tag is missing, Writer can make one correction using the same prepared media. If the correction does not pass the check, Writer keeps the original prompt and shows a warning instead of hiding the problem. Sequence uses its own bounded contract correction and per-chunk attention behavior described above.
 
 ## Refine
+
+This section describes Single mode. For chunk revisions, see [Sequence](#sequence).
 
 Select **Refine** to rewrite the current prompt from a short revision instruction. Refine uses the currently selected provider and model. It keeps the current task context and media manifest, and uses the prompt visible in the editor, including manual edits. A normal Refine request does not attach prepared image or video payloads again. After a successful rewrite, you can restore the previous prompt.
 
@@ -182,6 +280,16 @@ Music 3 has a collapsed **System prompt** control in its workspace. It contains 
 - **Stop & unload** cancels an active Direct or Ollama request and forces that prompt model to unload at the next safe point.
 - **Prompt models · N** groups unload actions when more than one Writer-managed local prompt model remains resident.
 
-**Keep model loaded** applies to Direct and Ollama. It is off by default. External llama.cpp and API providers only use **Cancel** because Writer does not own their server or model lifecycle.
+**Keep model loaded** applies to Direct, Ollama, and verified External llama.cpp routers. It is off by default. Single-model External servers and API providers only use **Cancel** because their lifecycle is server-managed.
+
+**Auto VRAM** is an optional ComfyUI-only control for Direct GGUF, local Ollama, and External llama.cpp. Before Writer starts, it asks an idle ComfyUI to unload workflow models and waits for the release to be confirmed. Before ComfyUI Queue continues, it stops and unloads a Writer-managed Direct or local Ollama model and confirms that it is no longer resident. Verified External routers also unload the exact selected model before Queue and confirm its state; single-model External servers receive only the before-generation step. Writer generation does not start if ComfyUI is busy or its release cannot be confirmed. Ordinary ComfyUI Queue is best-effort: cleanup failure or timeout shows a warning but does not block Queue. The control is off by default and is not shown in Standalone.
 
 Provider setup details are in [Choose a provider](PROVIDERS.md). Error-specific steps are in [Troubleshooting](TROUBLESHOOTING.md).
+
+### Desktop notifications
+
+Enable **Desktop notifications** below System Prompt in Settings and allow browser
+notifications. Writer notifies you when a request finishes or fails while its tab
+is hidden. Sequence sends one notification per run. Cancelled requests stay quiet.
+This works in ComfyUI and Standalone where the browser supports notifications.
+Keep the page open; browser and system notification settings still apply.

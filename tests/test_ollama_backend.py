@@ -1,4 +1,5 @@
 import json
+import socket
 import threading
 import time
 import unittest
@@ -116,6 +117,8 @@ class _FakeOllamaHandler(BaseHTTPRequestHandler):
                     "eval_count": 4,
                     "load_duration": 2_000_000_000,
                 })
+            if payload.get("model") == "incomplete":
+                events = events[:1]
             body = b"".join((json.dumps(event) + "\n").encode("utf-8") for event in events)
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
@@ -206,9 +209,49 @@ class OllamaBackendTests(unittest.TestCase):
                 self.assertEqual(normalize_ollama_url(value), value)
         self.assertEqual(normalize_ollama_url("https://ollama.example"), "https://ollama.example:443")
 
+    @patch("backend.models.ollama_backend.socket.getaddrinfo")
+    def test_ollama_host_allows_http_hostname_resolving_only_to_private_addresses(self, getaddrinfo):
+        getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("172.18.0.2", 11434)),
+        ]
+
+        self.assertEqual(normalize_ollama_url("http://ollama:11434"), "http://ollama:11434")
+        getaddrinfo.assert_called_once_with("ollama", 11434, type=socket.SOCK_STREAM)
+
+    @patch("backend.models.ollama_backend.socket.getaddrinfo")
+    def test_ollama_host_rejects_http_hostname_with_public_or_mixed_resolution(self, getaddrinfo):
+        for addresses in (("93.184.216.34",), ("172.18.0.2", "93.184.216.34")):
+            getaddrinfo.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, 11434))
+                for address in addresses
+            ]
+            with self.subTest(addresses=addresses), self.assertRaises(ModelError) as raised:
+                normalize_ollama_url("http://ollama:11434")
+            self.assertEqual(raised.exception.code, "OLLAMA_URL_INSECURE")
+
+    @patch("backend.models.ollama_backend.http.client.HTTPConnection")
+    @patch("backend.models.ollama_backend.socket.getaddrinfo")
+    def test_http_hostname_connection_pins_the_validated_address(self, getaddrinfo, http_connection):
+        private_result = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("172.18.0.2", 11434)),
+        ]
+        public_result = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 11434)),
+        ]
+        getaddrinfo.side_effect = [private_result, public_result]
+        response = http_connection.return_value.getresponse.return_value
+        response.status = 200
+        response.read.return_value = b"{}"
+
+        self.backend._request_json("GET", "/api/version", endpoint="http://ollama:11434")
+
+        getaddrinfo.assert_called_once_with("ollama", 11434, type=socket.SOCK_STREAM)
+        http_connection.assert_called_once_with("172.18.0.2", 11434, timeout=3)
+        request_headers = http_connection.return_value.request.call_args.kwargs["headers"]
+        self.assertEqual(request_headers["Host"], "ollama:11434")
+
     def test_ollama_host_rejects_public_http(self):
         for value in (
-            "http://example.com:11434",
             "http://8.8.8.8:11434",
             "http://172.32.0.1:11434",
             "http://192.0.2.1:11434",
@@ -330,6 +373,41 @@ class OllamaBackendTests(unittest.TestCase):
             "images": ["AAAA", "BBBB"],
         }])
 
+    def test_manual_budget_reaches_context_plan_and_ollama_request(self):
+        model = self._model()
+        plan = self.backend.preflight(model, self._assembled(), context_profile="auto",
+                                      kv_cache="auto", thinking=False, generation_budget=3000)
+        self.assertEqual(plan["max_output_tokens"], 3000)
+        self.assertTrue(plan["generation_budget_manual"])
+        self.backend.prepare_request()
+        self.backend._chat_completion(model["remote_model"], plan, endpoint=self.url,
+                                      messages=[{"role": "user", "content": "Hello"}],
+                                      max_tokens=plan["max_output_tokens"], thinking=False, seed=1, temperature=.7, top_p=.9, top_k=40)
+        request = next(body for method, path, body in reversed(_FakeOllamaHandler.requests) if path == "/api/chat")
+        self.assertEqual(request["options"]["num_predict"], 3000)
+        for budget in (0, -1, True, "3000"):
+            with self.subTest(budget=budget), self.assertRaises(ModelError) as error:
+                self.backend.preflight(model, self._assembled(), context_profile="auto",
+                                       kv_cache="auto", thinking=False, generation_budget=budget)
+            self.assertEqual(error.exception.code, "INVALID_GENERATION_BUDGET")
+
+    def test_custom_context_reaches_chat_and_respects_model_limit(self):
+        model = self._model()
+        model["model_context_limit"] = 65536
+        for tokens in (8192, 10000, 40960):
+            with self.subTest(tokens=tokens):
+                plan = self.backend.preflight(model, self._assembled(), context_profile="custom",
+                                              kv_cache="auto", thinking=False, context_tokens=tokens)
+                self.backend._chat_completion(model["remote_model"], plan, endpoint=self.url, messages=[],
+                                              max_tokens=128, thinking=False, seed=1,
+                                              temperature=.7, top_p=.9, top_k=40)
+                request = next(body for _, path, body in reversed(_FakeOllamaHandler.requests) if path == "/api/chat")
+                self.assertEqual(request["options"]["num_ctx"], tokens)
+        with self.assertRaises(ModelError) as oversized:
+            self.backend.preflight(model, self._assembled(), context_profile="custom",
+                                   kv_cache="auto", thinking=False, context_tokens=65537)
+        self.assertEqual(oversized.exception.code, "OLLAMA_MODEL_CONTEXT_LIMIT")
+
     def test_auto_context_uses_model_limit_and_sends_remaining_space_for_output(self):
         assembled = self._assembled()
         plan = self.backend.preflight(
@@ -379,6 +457,14 @@ class OllamaBackendTests(unittest.TestCase):
             self.backend.preflight(model, self._assembled(), context_profile="auto", kv_cache="auto", thinking=True)
         self.assertEqual(thinking_error.exception.code, "OLLAMA_THINKING_UNAVAILABLE")
 
+    def test_partial_stream_without_terminal_is_rejected(self):
+        with self.assertRaises(ModelError) as error:
+            self.backend._chat_completion(
+                "incomplete", {"context_tokens": 8192}, messages=[],
+                temperature=1.0, top_p=0.95, top_k=64, max_tokens=1536, seed=42, thinking=False,
+            )
+        self.assertEqual(error.exception.code, "OLLAMA_STREAM_ERROR")
+
     def test_native_stream_sends_num_ctx_images_and_keep_alive(self):
         result = self.backend._chat_completion(
             "gemma4:test", {"context_tokens": 8192},
@@ -424,6 +510,35 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "OLLAMA_STREAM_ERROR")
         self.assertTrue(any(path == "/api/generate" and payload["keep_alive"] == 0 for _, path, payload in _FakeOllamaHandler.requests))
 
+    def test_cleanup_failure_preserves_primary_result_and_rechecks_residency(self):
+        model = self._model()
+        for generation_fails in (False, True):
+            for cleanup_fails in (False, True):
+                with self.subTest(generation_fails=generation_fails, cleanup_fails=cleanup_fails):
+                    self.backend.prepare_request()
+                    primary = ModelError("GENERATION_FAILED", "primary error")
+                    cleanup = ModelError("OLLAMA_REQUEST_FAILED", "unload failed")
+                    with patch("backend.models.ollama_backend.run_h3_pipeline", return_value={"prompt": "OK"}, side_effect=primary if generation_fails else None), patch.object(
+                        self.backend, "unload", side_effect=cleanup if cleanup_fails else None,
+                    ):
+                        if generation_fails:
+                            with self.assertRaises(ModelError) as raised:
+                                self.backend.generate(model, self._assembled(), "session", thinking=False, seed=1, unload_after=True)
+                            self.assertIs(raised.exception, primary)
+                            if cleanup_fails:
+                                self.assertIsInstance(primary.details, dict)
+                                self.assertIn("cleanup_warning", primary.details)
+                        else:
+                            result = self.backend.generate(model, self._assembled(), "session", thinking=False, seed=1, unload_after=True)
+                            self.assertEqual(result["prompt"], "OK")
+                            self.assertEqual(bool(result.get("lifecycle_warning")), cleanup_fails)
+                    if cleanup_fails:
+                        self.assertIn({"endpoint": self.url, "model_id": model["remote_model"]}, self.backend.retained_targets())
+                        with patch.object(self.backend, "_running_models", return_value=[]) as running:
+                            self.backend.status(self.url)
+                            running.assert_called_once_with(self.url)
+                            self.assertEqual(self.backend.retained_targets(), [])
+
     def test_keep_loaded_skips_final_unload(self):
         model = self._model()
         plan = self.backend.preflight(model, self._assembled(), context_profile="auto", kv_cache="auto", thinking=False)
@@ -461,6 +576,19 @@ class OllamaBackendTests(unittest.TestCase):
         status = self.backend.retained_status()
 
         self.assertEqual(status["writer_retained_models"], [])
+        self.assertEqual(_FakeOllamaHandler.requests, [])
+
+    def test_retained_targets_include_each_endpoint_without_contacting_ollama(self):
+        remote = "http://192.168.0.30:11434"
+        self.backend.retained_models.add("gemma4:local")
+        with self.backend._retained_lock:
+            self.backend._retained_for(remote).add("gemma4:remote")
+        _FakeOllamaHandler.requests = []
+
+        self.assertEqual(self.backend.retained_targets(), [
+            {"endpoint": self.url, "model_id": "gemma4:local"},
+            {"endpoint": remote, "model_id": "gemma4:remote"},
+        ])
         self.assertEqual(_FakeOllamaHandler.requests, [])
 
     def test_stop_and_unload_overrides_keep_loaded(self):

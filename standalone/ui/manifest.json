@@ -1,0 +1,24 @@
+{
+  "name": "H3 Prompt Writer",
+  "short_name": "H3 Prompt Writer",
+  "description": "Standalone MiniMax H3 prompt writer with local and API providers",
+  "start_url": "./",
+  "icons": [
+    {
+      "src": "/app-icons/h3-prompt-writer-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/app-icons/h3-prompt-writer-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/assets/h3-prompt-writer-launcher.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ],
+  "display": "standalone"
+}

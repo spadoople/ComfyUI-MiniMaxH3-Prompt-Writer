@@ -1,7 +1,9 @@
+import http.client
 import json
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from backend.models.api_provider_backend import (
@@ -17,6 +19,7 @@ class _FakeApiHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     requests = []
     slow_started = threading.Event()
+    anthropic_endpoint = False
 
     def log_message(self, *_args):
         return
@@ -25,6 +28,7 @@ class _FakeApiHandler(BaseHTTPRequestHandler):
     def reset(cls):
         cls.requests = []
         cls.slow_started.clear()
+        cls.anthropic_endpoint = False
 
     def _json(self, payload, status=200, headers=None):
         body = json.dumps(payload).encode("utf-8")
@@ -47,6 +51,14 @@ class _FakeApiHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         type(self).requests.append(("GET", self.path, dict(self.headers), None))
         if self.path == "/v1/models":
+            if type(self).anthropic_endpoint:
+                if not self._anthropic_headers_valid():
+                    return
+                self._json({
+                    "data": [{"id": "claude-test-model", "type": "model", "display_name": "Claude"}],
+                    "has_more": False,
+                })
+                return
             self._json({
                 "data": [
                     {
@@ -87,6 +99,15 @@ class _FakeApiHandler(BaseHTTPRequestHandler):
         else:
             self._json({"error": {"message": "not found"}}, 404)
 
+    def _anthropic_headers_valid(self):
+        if self.headers.get("anthropic-version") != "2023-06-01":
+            self._json({"error": {"message": "anthropic-version: header is required"}}, 400)
+            return False
+        if self.headers.get("Authorization") != "Bearer secret-test-key":
+            self._json({"error": {"message": "invalid API key"}}, 401)
+            return False
+        return True
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length) or b"{}")
@@ -94,6 +115,12 @@ class _FakeApiHandler(BaseHTTPRequestHandler):
         if not self.path.endswith("/chat/completions"):
             self._json({"error": {"message": "not found"}}, 404)
             return
+        if type(self).anthropic_endpoint:
+            if not self._anthropic_headers_valid():
+                return
+            if "temperature" in payload or "top_p" in payload:
+                self._json({"error": {"message": "sampling controls are not supported by this model"}}, 400)
+                return
         model = payload.get("model")
         if model == "rate-limited":
             self._json(
@@ -116,7 +143,9 @@ class _FakeApiHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             return
-        if model == "stream-error":
+        if model == "incomplete":
+            body = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        elif model == "stream-error":
             body = (
                 'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n'
                 'data: {"error":{"message":"upstream stopped"}}\n\n'
@@ -174,6 +203,58 @@ class ApiProviderBackendTests(unittest.TestCase):
             reasoning_effort=kwargs.get("reasoning_effort", "minimal"),
             compatibility_profile=kwargs.get("compatibility_profile", "generic"),
         )
+
+    def test_partial_stream_without_terminal_is_rejected(self):
+        with self.assertRaises(ModelError) as error:
+            self.backend._request_chat_completion_stream(self._connection(), {"model": "incomplete"})
+        self.assertEqual(error.exception.code, "API_STREAM_INTERRUPTED")
+
+    def test_sampling_overrides_reach_generation_and_repair_without_pipeline_defaults(self):
+        connection = self._connection()
+        self.backend._connections[connection.id] = connection
+        model = self.backend._model_info(connection, "plain-model")
+        assembled = {"messages": [], "media_inputs": [], "input": {"mode": "T2VA", "duration_seconds": 5}}
+        sampling = {"temperature": 0, "top_p": 0.7, "top_k": 15, "frequency_penalty": -0.5, "presence_penalty": 1.2}
+        plan = self.backend.preflight(model, assembled, context_profile="auto", kv_cache="auto", thinking=False, sampling=sampling)
+
+        def pipeline(*args, complete, **kwargs):
+            for purpose in ("generation", "repair"):
+                complete(messages=[], temperature=0.3, top_p=0.9, top_k=40,
+                         max_tokens=50, seed=None, thinking=False, purpose=purpose)
+            return {"prompt": "OK"}
+
+        with patch("backend.models.api_provider_backend.run_h3_pipeline", side_effect=pipeline):
+            self.backend.generate(model, assembled, "test", thinking=False, seed=None, unload_after=False, runtime_plan=plan)
+        for request in [item for item in _FakeApiHandler.requests if item[0] == "POST"]:
+            self.assertEqual({key: request[3][key] for key in sampling}, sampling)
+        self.assertEqual(self.backend._request_count, 2)
+
+    def test_sampling_defaults_omit_every_sampler_for_every_preset(self):
+        names = {"temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"}
+        for preset in ("custom", "openrouter", "openai", "gemini"):
+            _ApiChatHandler(self.backend, self._connection(preset=preset), "plain-model")(
+                messages=[], temperature=0.2, top_p=0.5, top_k=12, max_tokens=30, seed=None, thinking=False)
+            self.assertFalse(names.intersection(_FakeApiHandler.requests[-1][3]))
+
+    def test_sampling_validation_uses_selected_model_metadata(self):
+        from backend.models.api_sampling import validate_sampling
+        model = self.backend._model_info(self._connection(preset="openrouter"),
+                                        {"id": "limited", "supported_parameters": ["temperature"]})
+        self.assertEqual(model["sampling_parameters"], ["temperature"])
+        self.assertEqual(validate_sampling({"temperature": 0}, model["sampling_parameters"]), {"temperature": 0})
+        for invalid in ({"top_k": 12}, {"temperature": True}, {"temperature": float("nan")},
+                        {"temperature": float("inf")}, {"temperature": "1"}, {"temperature": -1}, {"temperature": 3}):
+            with self.subTest(invalid=invalid), self.assertRaises(ModelError):
+                validate_sampling(invalid, model["sampling_parameters"])
+        for invalid in ({"top_k": 1.5}, {"top_k": -1}, {"top_p": 1.1}, {"presence_penalty": 3}):
+            with self.subTest(invalid=invalid), self.assertRaises(ModelError):
+                validate_sampling(invalid, list(invalid))
+        self.assertEqual(validate_sampling({}, []), {})
+        for preset in ("openai", "gemini"):
+            self.assertEqual(self.backend._model_info(self._connection(preset=preset), "plain-model")["sampling_parameters"], [])
+        connection = self._connection()
+        connection.base_url = "https://api.anthropic.com/v1"
+        self.assertEqual(self.backend._model_info(connection, "claude-test")["sampling_parameters"], [])
 
     def test_custom_url_accepts_loopback_and_private_lan_http_but_requires_https_for_public_hosts(self):
         self.assertEqual(normalize_api_base_url("custom", self.base_url), self.base_url)
@@ -245,6 +326,59 @@ class ApiProviderBackendTests(unittest.TestCase):
         self.assertEqual(result["model"]["capability_source"], "user_declared")
         self.assertTrue(result["model"]["capabilities"]["images"])
 
+    def test_anthropic_custom_endpoint_lists_models_and_streams_multimodal_completion(self):
+        _FakeApiHandler.anthropic_endpoint = True
+        messages = [
+            {"role": "system", "content": "Write an H3 prompt."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Use this image reference."},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
+            ]},
+        ]
+        with patch.object(self.backend, "_http_connection", side_effect=lambda _url, timeout: http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=timeout,
+        )):
+            result = self.backend.probe({
+                "preset": "custom",
+                "base_url": "https://API.ANTHROPIC.COM:443/v1/",
+                "credential": {"source": "session", "value": "secret-test-key"},
+                "custom_capabilities": {"images": True},
+            })
+            model = result["models"][0]
+            self.assertEqual(model["remote_model"], "claude-test-model")
+            self.assertTrue(model["capabilities"]["images"])
+            self.backend.list_models(result["connection"]["id"], refresh=True)
+            connection = self.backend._get_connection(result["connection"]["id"])
+            response = _ApiChatHandler(self.backend, connection, model["remote_model"])(
+                messages=messages, temperature=0.8, top_p=0.95, top_k=64,
+                max_tokens=1536, seed=None, thinking=False,
+            )
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "API_OK")
+        self.assertEqual([request[:2] for request in _FakeApiHandler.requests], [
+            ("GET", "/v1/models"), ("GET", "/v1/models"), ("POST", "/v1/chat/completions"),
+        ])
+        self.assertEqual(_FakeApiHandler.requests[-1][3]["messages"], messages)
+        self.assertNotIn("secret-test-key", json.dumps(result))
+
+    def test_anthropic_compatibility_does_not_apply_to_other_custom_hosts(self):
+        for base_url in ("https://api.anthropic.com.example/v1", "https://proxy.example/anthropic/v1"):
+            with self.subTest(base_url=base_url):
+                connection = self._connection()
+                connection.base_url = base_url
+                with patch.object(self.backend, "_http_connection", side_effect=lambda _url, timeout: http.client.HTTPConnection(
+                    "127.0.0.1", self.server.server_address[1], timeout=timeout,
+                )):
+                    _ApiChatHandler(self.backend, connection, "vision-reasoning-model", {"temperature": 0.8, "top_p": 0.95})(
+                        messages=[], temperature=0.8, top_p=0.95, top_k=64,
+                        max_tokens=1536, seed=None, thinking=False,
+                    )
+                request = _FakeApiHandler.requests[-1]
+                self.assertNotIn("anthropic-version", request[2])
+                self.assertEqual(request[2]["Authorization"], "Bearer secret-test-key")
+                self.assertEqual(request[3]["temperature"], 0.8)
+                self.assertEqual(request[3]["top_p"], 0.95)
+
     def test_custom_missing_model_list_without_manual_model_is_an_endpoint_error(self):
         with self.assertRaises(ModelError) as raised:
             self.backend.probe({
@@ -263,6 +397,20 @@ class ApiProviderBackendTests(unittest.TestCase):
             self.backend._fetch_models(connection)
         self.assertEqual(raised.exception.code, "API_MODEL_NOT_FOUND")
         self.assertEqual(raised.exception.details["status"], 404)
+
+    def test_private_lan_custom_enriches_lm_studio_without_widening_policy(self):
+        connection = self._connection()
+        connection.base_url = normalize_api_base_url("custom", "http://192.168.178.20:1234/v1")
+        response = {"models": [{"type": "llm", "key": "lan-model", "max_context_length": 262144,
+                                 "capabilities": {"vision": True}}]}
+        with patch.object(self.backend, "_request_json", return_value=(response, {})) as request:
+            metadata = self.backend._local_custom_model_metadata(connection)
+        request.assert_called_once_with(connection, "GET", "/api/v1/models")
+        self.assertEqual(connection.compatibility_profile, "lm_studio")
+        self.assertIn("lan-model", metadata)
+        self.assertEqual(metadata["lan-model"]["max_context_length"], 262144)
+        with self.assertRaises(ModelError):
+            normalize_api_base_url("custom", "http://8.8.8.8:1234/v1")
 
     def test_loopback_custom_enriches_lm_studio_vision_metadata(self):
         result = self.backend.probe({
@@ -290,7 +438,7 @@ class ApiProviderBackendTests(unittest.TestCase):
             thinking=False,
         )
         payload = _FakeApiHandler.requests[-1][3]
-        self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertNotIn("reasoning_effort", payload)
 
     def test_only_session_credentials_are_accepted(self):
         self.assertEqual(
@@ -331,7 +479,7 @@ class ApiProviderBackendTests(unittest.TestCase):
         self.assertEqual(response["choices"][0]["message"]["content"], "API_OK")
         payload = _FakeApiHandler.requests[-1][3]
         self.assertEqual(payload["messages"], messages)
-        self.assertEqual(payload["max_tokens"], 2048)
+        self.assertNotIn("max_tokens", payload)
         self.assertEqual(payload["reasoning"], {"enabled": True, "exclude": True})
         self.assertNotIn("top_k", payload)
         self.assertNotIn("seed", payload)
@@ -372,7 +520,32 @@ class ApiProviderBackendTests(unittest.TestCase):
         self.assertEqual(self.backend._usage_sources, ["reported", "reported"])
         self.assertNotIn("secret-test-key", json.dumps(posts[1][3]))
 
-    def test_openai_adapter_uses_max_completion_tokens_and_store_false(self):
+    def test_auto_budget_does_not_send_pipeline_caps_to_any_provider(self):
+        for preset, profile in (("openai", "generic"), ("openrouter", "generic"), ("gemini", "generic"), ("custom", "generic"), ("custom", "lm_studio")):
+            for thinking in (False, True):
+                with self.subTest(preset=preset, profile=profile, thinking=thinking):
+                    connection = self._connection(preset=preset, compatibility_profile=profile)
+                    handler = _ApiChatHandler(self.backend, connection, "plain-model")
+                    handler(messages=[], temperature=1.0, top_p=0.95, top_k=64, max_tokens=2048, seed=1, thinking=thinking)
+                    payload = _FakeApiHandler.requests[-1][3]
+                    self.assertNotIn("max_tokens", payload)
+                    self.assertNotIn("max_completion_tokens", payload)
+                    if profile == "lm_studio":
+                        self.assertNotIn("reasoning_effort", payload)
+
+    def test_manual_budget_reaches_compatible_api_providers(self):
+        for preset, field in (("openai", "max_completion_tokens"), ("custom", "max_tokens"), ("gemini", None)):
+            with self.subTest(preset=preset):
+                handler = _ApiChatHandler(self.backend, self._connection(preset=preset), "plain-model", limit_output=True)
+                handler(messages=[], temperature=1.0, top_p=0.95, top_k=64, max_tokens=4096, seed=None, thinking=False)
+                payload = _FakeApiHandler.requests[-1][3]
+                if field is None:
+                    self.assertNotIn("max_tokens", payload)
+                    self.assertNotIn("max_completion_tokens", payload)
+                else:
+                    self.assertEqual(payload[field], 4096)
+
+    def test_openai_adapter_uses_provider_budget_and_store_false(self):
         connection = self._connection(preset="openai")
         handler = _ApiChatHandler(self.backend, connection, "plain-model")
         handler(
@@ -385,7 +558,7 @@ class ApiProviderBackendTests(unittest.TestCase):
             thinking=False,
         )
         payload = _FakeApiHandler.requests[-1][3]
-        self.assertEqual(payload["max_completion_tokens"], 1536)
+        self.assertNotIn("max_completion_tokens", payload)
         self.assertFalse(payload["store"])
         self.assertEqual(payload["stream_options"], {"include_usage": True})
         self.assertNotIn("max_tokens", payload)
@@ -498,7 +671,7 @@ class ApiProviderBackendTests(unittest.TestCase):
         plan = self.backend.preflight(model, assembled, context_profile="auto", kv_cache="auto", thinking=False)
         self.assertEqual(plan["kv_cache"], "provider")
         self.assertEqual(plan["context_profile"], "provider")
-        self.assertEqual(plan["max_output_tokens"], 2_048)
+        self.assertIsNone(plan["max_output_tokens"])
         manual_budget_plan = self.backend.preflight(
             model,
             assembled,
@@ -516,7 +689,7 @@ class ApiProviderBackendTests(unittest.TestCase):
             kv_cache="auto",
             thinking=False,
         )
-        self.assertEqual(music_plan["max_output_tokens"], 1_536)
+        self.assertIsNone(music_plan["max_output_tokens"])
         with self.assertRaises(ModelError) as runtime:
             self.backend.preflight(model, assembled, context_profile="low", kv_cache="auto", thinking=False)
         self.assertEqual(runtime.exception.code, "API_RUNTIME_MANAGED")

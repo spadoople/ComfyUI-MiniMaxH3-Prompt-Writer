@@ -47,7 +47,7 @@ You can try other Ollama vision models when Ollama reports the required image ca
 
 ## Context and Thinking
 
-Writer requests the full context window reported by the selected Ollama model. The prompt, prepared media and generated text share that window. Writer estimates the space used by the request and makes the remaining space available for generation. If the model does not report a context window, Writer uses its existing automatic context tiers. Ollama manages the KV cache and GPU and CPU placement.
+Leave **Context (tokens)** empty to use the selected model’s reported maximum. If the model does not report a maximum, Writer chooses the smallest suitable automatic tier. Enter an exact token count to control memory use, and choose a Generation budget to set a reply limit. With the model's maximum context and no manual budget, Writer gives the remaining space after the request to generation. Ollama manages the KV cache and CPU/GPU placement.
 
 The **Thinking** switch is available when the selected Ollama model reports thinking support. Reasoning and the final response share the output budget.
 
@@ -62,3 +62,7 @@ With **Keep model loaded** off, Writer asks Ollama to unload the model after the
 Ollama is a shared service. Writer only offers unload controls for models it intentionally used and retained during the current Writer session. Retained-model state is tracked separately for each configured host.
 
 See [Troubleshooting](TROUBLESHOOTING.md#ollama-is-not-running) if the service or model is not detected.
+
+**Generation budget** in Settings sets the output token limit, including thinking.
+Auto keeps the default budget. Choose a preset or Custom when a response reaches
+its limit. The input, reply budget, and safety reserve must fit the context.

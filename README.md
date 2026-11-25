@@ -6,32 +6,32 @@
 
 H3 Prompt Writer is a prompt-writing workspace for MiniMax H3 inside ComfyUI. Start with a plain-language Creative Brief, add optional image, video, or audio references, and generate an editable prompt in the format expected by H3.
 
-It is a ComfyUI UI extension, not a workflow node. It writes prompt text for your existing H3 workflow. It does not run MiniMax H3, change the graph, or queue a video.
+It is a ComfyUI UI extension, not a workflow node. It writes prompt text for your existing H3 workflow and helps prepare reference media. The optional Media panel can add media loaders to your workflow. Writer does not run MiniMax H3 or queue a video.
 
-ComfyUI extension: **0.4.3** · [Download ZIP](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/releases/download/v0.4.3/H3-Prompt-Writer-ComfyUI-v0.4.3.zip) · [Installation](docs/INSTALLATION.md)
+ComfyUI extension: **0.4.8** · [Download ZIP](../../releases/download/v0.4.8/H3-Prompt-Writer-ComfyUI-v0.4.8.zip) · [Installation](docs/INSTALLATION.md)
 
-Standalone for Windows: **0.1.2** · [Download ZIP](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/releases/download/standalone-v0.1.2/H3-Prompt-Writer-Standalone-Windows-v0.1.2.zip) · [Setup guide](standalone/README.md)
+Standalone for Windows: **0.1.10** · [Download ZIP](../../releases/download/standalone-v0.1.10/H3-Prompt-Writer-Standalone-Windows-v0.1.10.zip) · [Setup guide](standalone/README.md)
 
-## What's new in v0.4.3
+## Highlights
 
-- Standalone for Windows. Use H3 Prompt Writer without ComfyUI.
-- Qwen 3.8 and Qwen3-VL support.
-- Expanded Direct GGUF support and runtime controls.
-- Smarter model and vision-projector detection.
-- Improved Reference media workflow.
-- Better local inference reliability.
+- Sequence: write several independent H3 prompts from one brief, with shared media and per-chunk edits.
+- Media Composer: combine pictures and video contact sheets into a collage.
+- Media Editor: crop images, trim and crop video, and extract frames.
+- Floating Media panel: drag Writer media into ComfyUI workflows.
+- Local and remote prompt models: Ollama, Direct GGUF, External llama.cpp, and APIs.
+- Standalone for Windows.
+- Light theme, adjustable interface size, and Auto VRAM management.
 
-## What's new in v0.3
+![H3 Prompt Writer](docs/assets/v0.3/reference-workspace.png)
 
-- Redesigned Writer and Settings interface.
-- Ollama as a simpler local setup.
-- Optional API providers.
-- External llama.cpp now has its own dedicated provider setup.
-- Saved drafts for every mode.
-- Better automatic model and context handling.
-- More reliable Reference prompts.
+## Releases
 
-![Reference mode in H3 Prompt Writer](docs/assets/v0.3/reference-workspace.png)
+**v0.4.6**: Sequence workspace with Official and Compact output, internal planning, format recovery, shared highlighting, and per-chunk refinement.\
+**v0.4.5**: Media Composer, Media Editor, Floating Media, themes, and runtime improvements.\
+**v0.4.4**: Standalone, Qwen 3.8 and Qwen3-VL, expanded Direct GGUF support.\
+**v0.3**: Redesigned Writer, Ollama/API/External setup, and per-mode drafts.
+
+See the [Changelog](CHANGELOG.md) for the full history.
 
 ## What it does
 
@@ -41,10 +41,11 @@ You do not need to write MiniMax section headings, timestamps, or reference synt
 Use <Picture 1> for character appearance, <Picture 2> for clothes, and only the movement from <Video 1>. The character walks through a rainy Tokyo street at night.
 ```
 
-Writer sends your brief, selected mode, prepared references, and the official MiniMax prompt-writing guide to the chosen prompt model. The result is an editable H3 prompt. You can change it directly, use **Refine** for a revision, or select **Copy prompt** and paste it into your H3 workflow.
+Writer sends your brief, selected mode, prepared references, and the selected writing contract to the prompt model. Single and Official Sequence use the official MiniMax guide. Compact Sequence uses descriptive prose with brief sound and music fields. The result is an editable H3 prompt. You can change it directly, use **Refine** for a revision, or select **Copy prompt** and paste it into your H3 workflow.
 
 ## Key features
 
+- Sequence workspace: plan a longer brief across editable chunks, with Official H3 structure or Compact descriptive prose. See [Sequence usage](docs/USAGE.md#sequence).
 - T2VA, I2VA, FL2VA, L2VA, and Reference modes.
 - Up to 9 images, 3 videos, and 3 audio references in Reference mode.
 - Clear `<Picture N>`, `<Video N>`, and `<Audio N>` labels for assigning identity, wardrobe, setting, motion, camera, sound, or other roles.
@@ -93,7 +94,7 @@ For Git, ZIP, Windows Portable, update, and provider-specific steps, see [Instal
 - Gemma 4 remains the simplest tested local choice. Direct GGUF also supports Qwen 3.8, compatible Qwen 3.8 fine-tunes, and Qwen3-VL. Untested compatible models may behave differently from the verified pairs.
 - Ollama, External llama.cpp, and compatible API endpoints let you try other multimodal models that accept images. Compatibility does not guarantee a good H3 prompt.
 - External llama.cpp also accepts text-only models for Music 3, T2VA, and Refine. Image and video requests still need a vision model.
-- Direct GGUF supports Gemma 4, Qwen 3.8, compatible Qwen 3.8 fine-tunes, and Qwen3-VL. The tested Qwen 3.8 and Qwen3-VL model and projector pairs are marked as verified. Other compatible combinations are marked as unverified. A missing projector leaves text-only T2VA available.
+- Direct GGUF supports Gemma 4, Qwen 3.8, compatible Qwen 3.8 fine-tunes, and Qwen3-VL. The tested Qwen 3.8 and Qwen3-VL model and projector pairs are marked as verified. Other compatible combinations are marked as unverified. A missing projector leaves text-only T2VA and Music3 available.
 - Gemini and a Custom OpenAI-compatible endpoint were tested live. OpenAI and OpenRouter have automated contract coverage but were not tested live with commercial credentials. Comfy Cloud has not been validated for v0.3.
 
 ## Documentation

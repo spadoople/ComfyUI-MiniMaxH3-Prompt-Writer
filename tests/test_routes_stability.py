@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sys
 import tempfile
@@ -7,6 +8,9 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import unquote
+
+from aiohttp.test_utils import TestClient, TestServer
 
 
 class _FakeRoutes:
@@ -76,12 +80,88 @@ class _MultipartRequest(_Request):
 class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
     session_id = "11111111-2222-4333-8444-555555555555"
 
+    async def test_workflow_download_preserves_mime_filename_and_bytes_over_http(self):
+        with tempfile.TemporaryDirectory() as directory:
+            asset = {"filename": "My recording.ogg", "content_revision": 0}
+            app = routes.web.Application()
+            app.router.add_get("/media/{asset_id}", routes.media_content)
+            with patch.object(routes.STORE, "get", return_value=asset):
+                async with TestClient(TestServer(app)) as client:
+                    for extension, mime in [("ogg", "audio/ogg"), ("mp3", "audio/mpeg"), ("png", "image/png")]:
+                        path = Path(directory) / f"original.{extension}"
+                        path.write_bytes(b"unchanged media bytes")
+                        asset["_original_path"] = str(path)
+                        async with client.get(f"/media/a?session_id={self.session_id}&kind=workflow&revision=0") as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(response.content_type, mime)
+                            self.assertEqual(await response.read(), path.read_bytes())
+                            self.assertEqual(unquote(response.headers["Content-Disposition"]),
+                                             f"inline; filename*=UTF-8''My recording.{extension}")
+
+    async def test_workflow_media_returns_original_or_applied_bytes_with_content_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original, applied = Path(directory) / "original.mp4", Path(directory) / "applied.mp4"
+            original.write_bytes(b"original video")
+            applied.write_bytes(b"applied video")
+            asset = {"filename": "My clip.mov", "_original_path": str(original), "_contact_sheet_path": "sheet.png", "content_revision": 2, "status": "needs_edit"}
+            request = _Request(query={"session_id": self.session_id, "kind": "workflow", "revision": "2"}, match_info={"asset_id": "a"})
+            with patch.object(routes.STORE, "get", return_value=asset):
+                response = await routes.media_content(request)
+                self.assertEqual(response._path, original)
+                self.assertEqual(response.headers["X-H3PS-Content-Hash"], hashlib.sha256(original.read_bytes()).hexdigest())
+                asset["_edited_path"] = str(applied)
+                response = await routes.media_content(request)
+                self.assertEqual(response._path, applied)
+                self.assertEqual(unquote(response.headers["Content-Disposition"]), "inline; filename*=UTF-8''My clip.mp4")
+                self.assertEqual(response.headers["X-H3PS-Content-Hash"], hashlib.sha256(applied.read_bytes()).hexdigest())
+                asset["content_revision"] = 3
+                with self.assertRaises(routes.web.HTTPConflict):
+                    await routes.media_content(request)
+
+    async def test_workflow_media_rechecks_revision_after_hashing(self):
+        asset = {"_original_path": "original.mp4", "content_revision": 2}
+        async def hashing(_function):
+            asset["content_revision"] = 3
+            return "a" * 64
+        request = _Request(query={"session_id": self.session_id, "kind": "workflow", "revision": "2"}, match_info={"asset_id": "a"})
+        with patch.object(routes.STORE, "get", return_value=asset), patch.object(routes.asyncio, "to_thread", side_effect=hashing):
+            with self.assertRaises(routes.web.HTTPConflict):
+                await routes.media_content(request)
+
+    async def test_external_unload_requires_a_known_exact_target(self):
+        with patch.object(routes.EXTERNAL_SERVER_BACKEND, "unload") as unload:
+            response = await routes.unload(_Request(body={"family": "external"}))
+        self.assertEqual(response.status, 400)
+        unload.assert_not_called()
+
+    async def test_external_unload_stops_only_matching_active_model(self):
+        backend = routes.EXTERNAL_SERVER_BACKEND
+        routes.STATE.update(active_request_id="request", selected_model_family="external", selected_model_id="writer-a")
+        with patch.object(backend.router, "target"), patch.object(backend, "request_unload", return_value=True) as stop, patch.object(backend, "unload") as unload:
+            response = await routes.unload(_Request(body={"family": "external", "model_id": "writer-a"}))
+            self.assertTrue(self.payload(response)["deferred"])
+            stop.assert_called_once()
+            unload.assert_not_called()
+            stop.reset_mock()
+            response = await routes.unload(_Request(body={"family": "external", "model_id": "writer-b"}))
+            self.assertFalse(self.payload(response)["deferred"])
+            stop.assert_not_called()
+            unload.assert_called_once_with("writer-b")
+
+    async def test_external_deferred_unload_does_not_cancel_unrelated_resolved_model(self):
+        with patch.object(routes.EXTERNAL_SERVER_BACKEND, "unload") as unload:
+            cancelled = await routes._apply_deferred_unload("external", "writer-a", {"family": "external", "id": "writer-b"})
+            self.assertFalse(cancelled)
+            unload.assert_called_once_with("writer-a")
+
+
     def setUp(self):
         routes.STATE.update({
             "phase": "idle",
             "active_request_id": None,
             "selected_model_id": None,
             "selected_model_family": None,
+            "selected_model_endpoint": None,
             "cancel_requested": False,
             "pending_unload_family": None,
             "pending_unload_model_id": None,
@@ -97,6 +177,7 @@ class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
             "active_request_id": None,
             "selected_model_id": None,
             "selected_model_family": None,
+            "selected_model_endpoint": None,
             "cancel_requested": False,
             "pending_unload_family": None,
             "pending_unload_model_id": None,
@@ -136,6 +217,29 @@ class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
             "aspect_ratio": "16:9",
             "model_id": "ollama::test-model",
         }
+
+    async def test_status_exposes_read_only_comfy_state_and_all_ollama_residency_targets(self):
+        direct = {"loaded": False, "loaded_model_id": None}
+        ollama = {"ollama_running": False, "writer_retained_models": []}
+        targets = [{"endpoint": "http://127.0.0.1:11434", "model_id": "gemma4:test"}]
+        with (
+            patch.object(routes.EXTERNAL_SERVER_BACKEND.router, "residency", side_effect=AssertionError("Status must not wait on router HTTP")),
+            patch.object(routes.EXTERNAL_SERVER_BACKEND.router, "snapshot", return_value={"targets":[]}),
+            patch.object(routes.GGUF_BACKEND, "status", return_value=direct),
+            patch.object(routes.OLLAMA_BACKEND, "retained_status", return_value=ollama),
+            patch.object(routes.OLLAMA_BACKEND, "retained_targets", return_value=targets),
+            patch.object(routes, "gpu_memory_snapshot", return_value={"free_mb": 12000}),
+        ):
+            response = await routes.get_status(_Request())
+
+        payload = self.payload(response)
+        self.assertEqual(payload["comfyui"], {
+            "available": False,
+            "queue_running": None,
+            "queue_pending": None,
+            "loaded_models": None,
+        })
+        self.assertEqual(payload["prompt_residency"]["ollama"]["targets"], targets)
 
     async def test_ollama_resolution_passes_the_selected_host_to_detection_and_inference(self):
         host = "http://192.168.1.20:11434"
@@ -427,6 +531,101 @@ class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
         resolved_backend.cancel.assert_called_once()
         resolved_backend.preflight.assert_not_called()
         self.assertIsNone(routes.STATE["active_request_id"])
+
+    async def test_targeted_local_ollama_unload_keeps_active_remote_request_running(self):
+        local_endpoint = "http://127.0.0.1:11434"
+        remote_endpoint = "http://192.168.0.20:11434"
+        local_model_id = "ollama::gemma4:local"
+        routes.STATE.update({
+            "phase": "generating",
+            "active_request_id": "remote-request",
+            "selected_model_id": f"ollama::{remote_endpoint}::gemma4:remote",
+            "selected_model_family": "ollama",
+            "selected_model_endpoint": remote_endpoint,
+        })
+        backend = MagicMock(externally_managed=False)
+
+        with (
+            patch.object(routes, "OLLAMA_BACKEND", backend),
+            patch.dict(routes.BACKENDS, {"ollama": backend}),
+        ):
+            unloaded = await routes.unload(_Request(body={
+                "family": "ollama",
+                "model_id": local_model_id,
+                "ollama_host": local_endpoint,
+            }))
+
+        self.assertEqual(self.payload(unloaded), {"unload_requested": True, "deferred": False})
+        backend.unload.assert_called_once_with(local_model_id, local_endpoint)
+        backend.request_unload.assert_not_called()
+        self.assertFalse(routes.STATE["cancel_requested"])
+        self.assertEqual(routes.STATE["phase"], "generating")
+
+    async def test_targeted_active_ollama_unload_still_cancels_matching_request(self):
+        local_endpoint = "http://127.0.0.1:11434"
+        local_model_name = "gemma4:local"
+        local_model_id = f"ollama::{local_model_name}"
+        routes.STATE.update({
+            "phase": "generating",
+            "active_request_id": "local-request",
+            "selected_model_id": local_model_id,
+            "selected_model_family": "ollama",
+            "selected_model_endpoint": local_endpoint,
+        })
+        backend = MagicMock(externally_managed=False)
+        backend.request_unload.return_value = True
+
+        with (
+            patch.object(routes, "OLLAMA_BACKEND", backend),
+            patch.dict(routes.BACKENDS, {"ollama": backend}),
+        ):
+            unloaded = await routes.unload(_Request(body={
+                "family": "ollama",
+                "model_id": local_model_name,
+                "ollama_host": local_endpoint,
+            }))
+
+        self.assertEqual(self.payload(unloaded), {"unload_requested": True, "deferred": True})
+        backend.request_unload.assert_called_once_with()
+        backend.unload.assert_not_called()
+
+    async def test_targeted_ollama_unload_is_resolved_before_cancelling_preparing_request(self):
+        local_endpoint = "http://127.0.0.1:11434"
+        remote_endpoint = "http://192.168.0.20:11434"
+        local_model_id = "ollama::gemma4:local"
+        remote_model = {
+            "id": f"ollama::{remote_endpoint}::gemma4:remote",
+            "name": "gemma4:remote",
+            "family": "ollama",
+            "endpoint": remote_endpoint,
+        }
+        routes.STATE.update({
+            "phase": "preparing",
+            "active_request_id": "resolving-request",
+            "selected_model_id": None,
+            "selected_model_family": None,
+            "selected_model_endpoint": None,
+        })
+        backend = MagicMock(externally_managed=False)
+
+        with (
+            patch.object(routes, "OLLAMA_BACKEND", backend),
+            patch.dict(routes.BACKENDS, {"ollama": backend}),
+        ):
+            unloaded = await routes.unload(_Request(body={
+                "family": "ollama",
+                "model_id": local_model_id,
+                "ollama_host": local_endpoint,
+            }))
+            cancelled, family, model_id, endpoint = routes._set_active_model("resolving-request", remote_model)
+            deferred_cancelled = await routes._apply_deferred_unload(family, model_id, remote_model, endpoint)
+
+        self.assertEqual(self.payload(unloaded), {"unload_requested": True, "deferred": True})
+        self.assertFalse(cancelled)
+        self.assertFalse(deferred_cancelled)
+        backend.unload.assert_called_once_with(local_model_id, local_endpoint)
+        backend.request_unload.assert_not_called()
+        self.assertFalse(routes.STATE["cancel_requested"])
 
     async def test_generate_and_refine_return_guide_load_json_errors(self):
         generate_body = self.generation_body("Use <Video 1>.")
@@ -809,6 +1008,35 @@ class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(derived_dir.exists())
 
         commit_resample.assert_not_called()
+        self.assertFalse(routes.STATE["media_mutation_active"])
+
+    async def test_cancelled_editor_save_discards_output_without_committing(self):
+        started, release = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "edit"
+            def prepare(*_args):
+                directory.mkdir()
+                started.set()
+                release.wait(timeout=5)
+                return {"directory": directory}
+            with patch.object(routes.STORE,"get",return_value={"mode":"Reference"}), patch.object(routes,"prepare_edit",side_effect=prepare), patch.object(routes,"commit_edit") as commit:
+                task=asyncio.create_task(routes.edit_media(_Request(match_info={"asset_id":"video"},body={"session_id":self.session_id,"action":"save"})))
+                self.assertTrue(await asyncio.to_thread(started.wait,2))
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertTrue(routes.STATE["media_mutation_active"])
+                self.assertIsNone(routes._claim_generation_request())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):await task
+                commit.assert_not_called()
+            self.assertFalse(directory.exists())
+        self.assertFalse(routes.STATE["media_mutation_active"])
+
+    async def test_editor_preview_never_commits_or_invalidates_generation(self):
+        with patch.object(routes.STORE,"get",return_value={"mode":"Reference"}), patch.object(routes,"prepare_edit",return_value={"image":"data:image/jpeg;base64,AA=="}), patch.object(routes,"commit_edit") as commit, patch.object(routes,"_invalidate_generation_cache") as invalidate:
+            response=await routes.edit_media(_Request(match_info={"asset_id":"video"},body={"session_id":self.session_id,"action":"preview"}))
+        self.assertEqual(response.status,200)
+        commit.assert_not_called();invalidate.assert_not_called()
         self.assertFalse(routes.STATE["media_mutation_active"])
 
     async def test_generate_success_caches_only_task_context_and_always_returns_to_idle(self):

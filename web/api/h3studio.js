@@ -10,6 +10,7 @@ async function request(path, options) {
 
 function post(path, body = {}, options = {}) {
   return request(path, {
+    ...options,
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -20,6 +21,7 @@ function post(path, body = {}, options = {}) {
 const ollamaQuery = (name, host) => host ? `?${name}=${encodeURIComponent(host)}` : "";
 
 export const getStatus = (ollamaHost = null) => request(`/status${ollamaQuery("ollama_host", ollamaHost)}`);
+export const selectProjector = (modelId, projector) => post("/models/projector", { model_id: modelId, projector });
 export const getModels = () => request("/models");
 export const diagnoseGGUFRuntime = (refresh = false) => post("/runtime/gguf/diagnostics", { refresh });
 export const probeExternalServer = (payload) => post("/external-server/probe", payload);
@@ -32,10 +34,11 @@ export const getGuides = () => request("/guides");
 export const getGuide = (mode) => request(`/guides/${encodeURIComponent(mode)}`);
 export const getSystemPrompt = (mode) => request(`/system-prompt/${encodeURIComponent(mode)}`);
 export const assemble = (payload) => post("/assemble", payload);
-export const generate = (payload) => post("/generate", payload, payload.ollama_model ? { timeoutMs: null } : undefined);
+// Inference can outlast ComfyUI's default response-header timeout.
+export const generate = (payload) => post("/generate", payload, { timeoutMs: null });
 export const cancel = () => post("/cancel");
 export const unloadModel = (target = {}) => post("/unload", target);
-export const refine = (payload) => post("/refine", payload, payload.ollama_model ? { timeoutMs: null } : undefined);
+export const refine = (payload) => post("/refine", payload, { timeoutMs: null });
 
 export async function freeComfyVram() {
   const response = await api.fetchApi("/free", {
@@ -63,6 +66,13 @@ export const importComfyInputMedia = (sessionId, mode, filenames) => post(
 );
 
 export const listMedia = (sessionId) => request(`/media?session_id=${encodeURIComponent(sessionId)}`);
+export async function editMedia(sessionId, assetId, options) {
+  const response = await api.fetchApi(`${PREFIX}/media/${encodeURIComponent(assetId)}/edit`, {
+    method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({session_id:sessionId,...options}),
+  });
+  if (["download", "audio"].includes(options.action) && response.ok) return response.blob();
+  return readApiResponse(response);
+}
 export const removeMedia = (sessionId, assetId) => request(
   `/media/${encodeURIComponent(assetId)}?session_id=${encodeURIComponent(sessionId)}`,
   { method: "DELETE" },

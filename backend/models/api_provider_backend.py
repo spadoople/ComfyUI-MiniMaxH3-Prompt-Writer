@@ -22,6 +22,7 @@ from ..context import (
 from ..h3_pipeline import run_h3_pipeline, validate_media_capabilities
 from ..version import VERSION
 from .contract import ModelError
+from .api_sampling import sampling_parameters, validate_sampling
 
 
 CONNECT_TIMEOUT_SECONDS = 10
@@ -144,6 +145,10 @@ def _api_path(base_url: str, suffix: str) -> str:
     return f"{path}/{suffix.lstrip('/')}" or "/"
 
 
+def _is_anthropic_endpoint(base_url: str) -> bool:
+    return urlsplit(base_url).hostname == "api.anthropic.com"
+
+
 @dataclass
 class ApiConnection:
     id: str
@@ -159,10 +164,12 @@ class ApiConnection:
 
 
 class _ApiChatHandler:
-    def __init__(self, backend: "ApiProviderBackend", connection: ApiConnection, model_id: str) -> None:
+    def __init__(self, backend: "ApiProviderBackend", connection: ApiConnection, model_id: str, sampling: dict[str, Any] | None = None, *, limit_output: bool = False) -> None:
         self.backend = backend
         self.connection = connection
         self.model_id = model_id
+        self.sampling = dict(sampling or {})
+        self.limit_output = limit_output
 
     def __call__(
         self,
@@ -171,12 +178,12 @@ class _ApiChatHandler:
         temperature: float,
         top_p: float,
         top_k: int,
-        max_tokens: int,
+        max_tokens: int | None,
         seed: int | None,
         thinking: bool,
         **_unused: Any,
     ) -> dict[str, Any]:
-        del top_k, seed
+        del temperature, top_p, top_k, seed
         payload: dict[str, Any] = {
             "model": self.model_id,
             "messages": messages,
@@ -186,28 +193,24 @@ class _ApiChatHandler:
         if preset in {"openai", "gemini", "openrouter"}:
             payload["stream_options"] = {"include_usage": True}
         if preset == "openai":
-            payload["max_completion_tokens"] = max_tokens
             payload["store"] = False
-        else:
-            payload["max_tokens"] = max_tokens
-        # New OpenAI reasoning models and Gemini 3.6+ reject or deprecate
-        # sampling controls. Keep those presets on the smallest portable set.
-        if not thinking and preset in {"openrouter", "custom"}:
-            payload["temperature"] = temperature
-            payload["top_p"] = top_p
+        # Only an explicit budget becomes an API request cap. Gemini manages its own output.
+        if self.limit_output and max_tokens is not None and preset != "gemini":
+            field = "max_completion_tokens" if preset == "openai" else "max_tokens"
+            payload[field] = max_tokens
+        # Never inherit the local pipeline's sampler defaults for API requests.
+        # Values are validated against the selected provider/model in preflight.
+        payload.update(self.sampling)
         if preset == "gemini":
             # Let Gemini manage the combined hidden reasoning and visible output
             # budget. Hard-coding per-effort token allowances would duplicate
             # provider policy and becomes stale as models change.
             effort = self.connection.reasoning_effort
             payload["reasoning_effort"] = effort
-            payload.pop("max_tokens", None)
         elif thinking and preset == "openai":
             payload["reasoning_effort"] = "low"
         elif thinking and preset == "openrouter":
             payload["reasoning"] = {"enabled": True, "exclude": True}
-        elif preset == "custom" and self.connection.compatibility_profile == "lm_studio":
-            payload["reasoning_effort"] = "low" if thinking else "none"
         return self.backend._request_chat_completion_stream(self.connection, payload)
 
 
@@ -363,6 +366,10 @@ class ApiProviderBackend:
         }
         if connection.api_key:
             headers["Authorization"] = f"Bearer {connection.api_key}"
+        if _is_anthropic_endpoint(connection.base_url):
+            # Model discovery uses Anthropic's native Models API, even when
+            # generation uses its OpenAI-compatible Chat Completions route.
+            headers["anthropic-version"] = "2023-06-01"
         return headers
 
     def _request_json(
@@ -490,10 +497,15 @@ class ApiProviderBackend:
             "remote_model": model_id,
             "source_label": f"{PRESETS[connection.preset]['name']} · API provider",
             "pricing": pricing,
+            "sampling_parameters": sampling_parameters(
+                connection.preset, supported_parameters,
+                anthropic=_is_anthropic_endpoint(connection.base_url),
+            ),
         }
 
     def _local_custom_model_metadata(self, connection: ApiConnection) -> dict[str, dict[str, Any]]:
-        if connection.preset != "custom" or not _is_loopback(urlsplit(connection.base_url).hostname or ""):
+        hostname = urlsplit(connection.base_url).hostname or ""
+        if connection.preset != "custom" or not (_is_loopback(hostname) or _is_private_lan(hostname)):
             return {}
         try:
             data, _headers = self._request_json(connection, "GET", "/api/v1/models")
@@ -666,7 +678,9 @@ class ApiProviderBackend:
         kv_cache: str | None,
         thinking: bool,
         generation_budget: int | None = None,
+        sampling: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        api_sampling = validate_sampling(sampling, model_info.get("sampling_parameters", []))
         if (context_profile or "auto").lower() != "auto" or (kv_cache or "auto").lower() != "auto":
             raise ModelError(
                 "API_RUNTIME_MANAGED",
@@ -712,9 +726,10 @@ class ApiProviderBackend:
                     "suggestion": "Choose a larger-context API model or remove references.",
                 },
             )
-        max_output_tokens = min(desired_output, available_output)
+        max_output_tokens = min(desired_output, available_output) if generation_budget is not None else None
         return {
             "requested_context_profile": "auto",
+            "api_sampling": api_sampling,
             "context_profile": "provider",
             "context_tokens": context_tokens,
             "requested_kv_cache": "auto",
@@ -724,9 +739,9 @@ class ApiProviderBackend:
             "estimated_input_tokens": estimated_input_tokens,
             "visual_input_count": visual_input_count,
             "max_output_tokens": max_output_tokens,
-            "reserved_output_tokens": max_output_tokens + CONTEXT_SAFETY_TOKENS,
+            "reserved_output_tokens": (max_output_tokens or 0) + CONTEXT_SAFETY_TOKENS,
             "generation_budget_manual": generation_budget is not None,
-            "thinking_budget_reduced": thinking and max_output_tokens < THINKING_OUTPUT_TOKENS,
+            "thinking_budget_reduced": thinking and max_output_tokens is not None and max_output_tokens < THINKING_OUTPUT_TOKENS,
             "context_limit_known": known_context is not None,
         }
 
@@ -748,6 +763,7 @@ class ApiProviderBackend:
             self._connection = http_connection
         content_parts: list[str] = []
         finish_reason: str | None = None
+        terminal_received = False
         usage: dict[str, Any] = {}
         usage_source = "missing"
         request_id: str | None = None
@@ -779,6 +795,7 @@ class ApiProviderBackend:
                     continue
                 event = decoded[5:].strip()
                 if event == "[DONE]":
+                    terminal_received = True
                     break
                 try:
                     chunk = json.loads(event)
@@ -831,6 +848,12 @@ class ApiProviderBackend:
                 if self._connection is http_connection:
                     self._connection = None
             http_connection.close()
+        if not terminal_received and finish_reason is None:
+            raise ModelError(
+                "API_STREAM_INTERRUPTED",
+                "The generation stream ended before completion.",
+                {"partial_output": bool(content_parts)},
+            )
         content = "".join(content_parts)
         if not usage:
             usage = {"prompt_tokens": 0, "completion_tokens": estimate_text_tokens(content)}
@@ -875,7 +898,10 @@ class ApiProviderBackend:
             try:
                 if on_phase:
                     on_phase("loading_model")
-                handler = _ApiChatHandler(self, connection, model_info["remote_model"])
+                handler = _ApiChatHandler(
+                    self, connection, model_info["remote_model"], runtime_plan.get("api_sampling"),
+                    limit_output=runtime_plan.get("generation_budget_manual", False),
+                )
 
                 def complete(**kwargs: Any) -> dict[str, Any]:
                     kwargs.pop("purpose", None)

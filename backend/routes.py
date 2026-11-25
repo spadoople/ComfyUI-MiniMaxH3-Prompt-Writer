@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import mimetypes
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 from uuid import uuid4
 
 from aiohttp import web
@@ -14,10 +17,12 @@ import folder_paths
 from server import PromptServer
 
 from .assembly import AssemblyError, assemble_lyrics_request, assemble_refinement, assemble_request
-from .catalog import discover_models_with_diagnostics, find_model, model_setup_catalog
+from .catalog import discover_models_with_diagnostics, find_model, model_setup_catalog, resolve_projector
+from .comfy_state import comfyui_runtime_snapshot
 from .devlog import DEVELOPER_MODE, LOG_PATH, PeakVRAMMonitor, gpu_memory_snapshot, write_event
 from .guides import MODE_GUIDES, guide_catalog, guide_for_mode
 from .media import CACHE_ROOT, MAX_FILE_BYTES, MODE_LIMITS, STORE, MediaError, media_type, parse_session_id
+from .media_editor import browser_source, commit_edit, prepare_edit, video_frame
 from .memory import assess_free_vram
 from .models.gguf_backend import BACKEND as GGUF_BACKEND
 from .models.external_server_backend import BACKEND as EXTERNAL_SERVER_BACKEND
@@ -27,6 +32,7 @@ from .models.contract import ModelError
 from .runtime_diagnostics import get_gguf_runtime_diagnostics
 from .system_prompts import SystemPromptError, system_prompt_for_mode
 from .version import VERSION
+from .sequence_routes import register_sequence_routes
 
 
 ROUTE_PREFIX = "/h3studio"
@@ -36,6 +42,7 @@ STATE: dict[str, Any] = {
     "active_request_id": None,
     "selected_model_id": None,
     "selected_model_family": None,
+    "selected_model_endpoint": None,
     "cancel_requested": False,
     "pending_unload_family": None,
     "pending_unload_model_id": None,
@@ -167,6 +174,7 @@ def _claim_generation_request() -> str | None:
             "active_request_id": request_id,
             "selected_model_id": None,
             "selected_model_family": None,
+            "selected_model_endpoint": None,
             "cancel_requested": False,
             "pending_unload_family": None,
             "pending_unload_model_id": None,
@@ -182,6 +190,7 @@ def _set_active_model(request_id: str, model: dict[str, Any]) -> tuple[bool, str
         STATE.update({
             "selected_model_id": model["id"],
             "selected_model_family": model["family"],
+            "selected_model_endpoint": model.get("endpoint") if model["family"] == "ollama" else None,
         })
         pending_family = STATE["pending_unload_family"]
         pending_model_id = STATE["pending_unload_model_id"]
@@ -289,32 +298,78 @@ async def _resolve_model(body: dict[str, Any]) -> dict[str, Any] | None:
                 {"requested_model_id": requested_id, "current_model_id": model["id"]},
             )
         return model
+    if body.get("gguf_projector"):
+        model = resolve_projector(str(body.get("model_id") or ""), body["gguf_projector"])
+        if model is None:
+            raise ModelError("INVALID_PROJECTOR", "The selected projector is no longer compatible or available. Choose it again in Settings.")
+        return model
     return find_model(str(body.get("model_id") or ""))
 
 
 async def _apply_deferred_unload(
     family: str,
     model_id: str | None,
-    resolved_family: str,
+    resolved_model: dict[str, Any],
     endpoint: str | None = None,
-) -> None:
+) -> bool:
     backend = BACKENDS.get(family)
     if backend is None:
-        return
-    if family == resolved_family:
+        return False
+    resolved_family = resolved_model["family"]
+    same_target = family == resolved_family
+    if family == "external":
+        if not model_id:
+            return False
+        _result, cancellation = await _run_thread_worker(backend.unload, model_id)
+        _propagate_worker_cancellation(cancellation)
+        return same_target and model_id == resolved_model.get("id")
+    if same_target and family == "ollama":
+        same_target = _ollama_target_matches(
+            model_id,
+            endpoint,
+            resolved_model.get("id"),
+            resolved_model.get("endpoint"),
+        )
+    if same_target:
         request_unload = getattr(backend, "request_unload", None)
         if callable(request_unload):
             request_unload()
         else:
             backend.cancel()
-        return
+        return True
     if getattr(backend, "externally_managed", False):
-        return
+        return False
     if family == "ollama":
         _result, cancellation = await _run_thread_worker(backend.unload, model_id, endpoint)
     else:
         _result, cancellation = await _run_thread_worker(backend.unload)
     _propagate_worker_cancellation(cancellation)
+    return False
+
+
+def _ollama_target_matches(
+    requested_model_id: str | None,
+    requested_endpoint: str | None,
+    active_model_id: str | None,
+    active_endpoint: str | None,
+) -> bool:
+    if requested_endpoint is not None and requested_endpoint != active_endpoint:
+        return False
+    requested_model_name = _ollama_model_name(requested_model_id, requested_endpoint or active_endpoint)
+    active_model_name = _ollama_model_name(active_model_id, active_endpoint)
+    if requested_model_id is not None and requested_model_name != active_model_name:
+        return False
+    return True
+
+
+def _ollama_model_name(model_id: str | None, endpoint: str | None) -> str | None:
+    if model_id is None or not model_id.startswith("ollama::"):
+        return model_id
+    if endpoint:
+        endpoint_prefix = f"ollama::{endpoint}::"
+        if model_id.startswith(endpoint_prefix):
+            return model_id[len(endpoint_prefix):]
+    return model_id[len("ollama::"):]
 
 
 async def _prepare_generation_runtime(
@@ -331,14 +386,15 @@ async def _prepare_generation_runtime(
 
     cancel_requested, pending_unload_family, pending_unload_model_id, pending_unload_endpoint = _set_active_model(request_id, model)
     backend.prepare_request()
+    deferred_cancel_requested = False
     if pending_unload_family is not None:
-        await _apply_deferred_unload(
+        deferred_cancel_requested = await _apply_deferred_unload(
             pending_unload_family,
             pending_unload_model_id,
-            model["family"],
+            model,
             pending_unload_endpoint,
         )
-    if cancel_requested:
+    if cancel_requested or deferred_cancel_requested:
         backend.cancel()
         raise ModelError("GENERATION_CANCELLED", "Generation was cancelled.")
 
@@ -347,11 +403,14 @@ async def _prepare_generation_runtime(
         "kv_cache": body.get("kv_cache", "auto"),
         "thinking": body.get("thinking", False),
     }
-    if model["family"] in {"gguf", "api"}:
+    if model["family"] in {"gguf", "ollama", "api"}:
         runtime_options["generation_budget"] = body.get("generation_budget")
+    if model["family"] in {"gguf", "ollama"} and body.get("context_tokens") is not None:
+        runtime_options["context_tokens"] = body["context_tokens"]
+    if model["family"] == "api":
+        runtime_options["sampling"] = body.get("api_sampling")
     if model["family"] == "gguf":
         runtime_options.update({
-            "context_tokens": body.get("context_tokens"),
             "reasoning_effort": body.get("reasoning_effort", "auto"),
         })
     runtime_plan, cancellation = await _run_thread_worker(
@@ -447,10 +506,12 @@ async def get_status(request: web.Request) -> web.Response:
     family = state.get("selected_model_family")
     backend = BACKENDS.get(family, GGUF_BACKEND)
     ollama_status_call = OLLAMA_BACKEND.status if family == "ollama" else OLLAMA_BACKEND.retained_status
-    direct_status, ollama_status = await asyncio.gather(
+    direct_status, ollama_status, external_residency = await asyncio.gather(
         asyncio.to_thread(GGUF_BACKEND.status),
         asyncio.to_thread(ollama_status_call, ollama_host),
+        asyncio.to_thread(EXTERNAL_SERVER_BACKEND.router.snapshot),
     )
+    comfyui_status = comfyui_runtime_snapshot(getattr(PromptServer.instance, "prompt_queue", None))
     if family == "gguf" or family is None:
         backend_status = direct_status
     elif family == "ollama":
@@ -466,13 +527,16 @@ async def get_status(request: web.Request) -> web.Response:
         "version": VERSION,
         "developer_log_path": str(LOG_PATH) if DEVELOPER_MODE else None,
         "gpu_memory": gpu_memory_snapshot(),
+        "comfyui": comfyui_status,
         "prompt_residency": {
+            "external": external_residency,
             "direct": {
                 "loaded": bool(direct_status.get("loaded")),
                 "model_id": direct_status.get("loaded_model_id"),
             },
             "ollama": {
                 "models": ollama_status.get("writer_retained_models", []),
+                "targets": OLLAMA_BACKEND.retained_targets(),
                 "running": bool(ollama_status.get("ollama_running")),
             },
         },
@@ -484,10 +548,21 @@ async def get_models(_request: web.Request) -> web.Response:
     models, discovery = discover_models_with_diagnostics()
     return web.json_response({
         "models": models,
-        "model_directory": "ComfyUI/models/LLM/",
+        "model_directory": discovery["roots"][0]["path"] if discovery["roots"] else "ComfyUI/models/LLM/",
         "setup": model_setup_catalog(),
         "discovery": discovery,
     })
+
+
+@routes.post(f"{ROUTE_PREFIX}/models/projector")
+async def select_projector(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    if not isinstance(body, dict) or not isinstance(body.get("model_id"), str) or not isinstance(body.get("projector"), str):
+        return _error("INVALID_PROJECTOR", "Select a model and a compatible projector.", status=400)
+    model = await asyncio.to_thread(resolve_projector, body["model_id"], body["projector"])
+    if model is None:
+        return _error("INVALID_PROJECTOR", "The selected projector is no longer compatible or available. Refresh the model list.", status=400)
+    return web.json_response({"model": model})
 
 
 @routes.post(f"{ROUTE_PREFIX}/runtime/gguf/diagnostics")
@@ -676,7 +751,6 @@ async def generate(request: web.Request) -> web.Response:
             unload_after=body.get("unload_after", True),
             context_profile=body.get("context_profile", "auto"),
             kv_cache=body.get("kv_cache", "auto"),
-            **({"generation_budget": body.get("generation_budget")} if model["family"] == "api" else {}),
             runtime_plan=runtime_plan,
             on_phase=on_phase,
         )
@@ -755,19 +829,44 @@ async def unload(request: web.Request) -> web.Response:
         return _error("INVALID_REQUEST", "model_id must be a string.", status=400)
     if ollama_host is not None and not isinstance(ollama_host, str):
         return _error("INVALID_OLLAMA_URL", "The Ollama host must be a URL string.", status=400)
+    if family == "ollama" and ollama_host is not None:
+        try:
+            ollama_host = normalize_ollama_url(ollama_host)
+        except ModelError as error:
+            return _error(error.code, error.message, status=400, details=error.details)
     backend = BACKENDS[family]
+    if family == "external":
+        try:
+            EXTERNAL_SERVER_BACKEND.router.target(model_id)
+        except ModelError as error:
+            return _error(error.code, error.message, status=400)
     with STATE_LOCK:
         active = STATE["active_request_id"] is not None
         active_family = STATE.get("selected_model_family")
+        active_model_id = STATE.get("selected_model_id")
+        active_endpoint = STATE.get("selected_model_endpoint")
         if active and active_family is None:
-            STATE["phase"] = "cancelling"
-            STATE["cancel_requested"] = True
+            targeted_ollama_unload = family == "ollama" and (model_id is not None or ollama_host is not None)
+            if not targeted_ollama_unload and family != "external":
+                STATE["phase"] = "cancelling"
+                STATE["cancel_requested"] = True
             STATE["pending_unload_family"] = family
             STATE["pending_unload_model_id"] = model_id
             STATE["pending_unload_endpoint"] = ollama_host
             return web.json_response({"unload_requested": True, "deferred": True})
-    active_same_family = active and active_family == family
-    if active_same_family:
+    active_same_target = active and active_family == family
+    if active_same_target and family == "ollama":
+        active_same_target = _ollama_target_matches(model_id, ollama_host, active_model_id, active_endpoint)
+    if family == "external":
+        try:
+            if active_same_target and model_id == active_model_id:
+                return web.json_response({"unload_requested": backend.request_unload(), "deferred": True})
+            _result, cancellation = await _run_thread_worker(backend.unload, model_id)
+            _propagate_worker_cancellation(cancellation)
+            return web.json_response({"unload_requested": True, "deferred": False})
+        except ModelError as error:
+            return _error(error.code, error.message, status=502, details=error.details)
+    if active_same_target:
         request_unload = getattr(backend, "request_unload", None)
         if callable(request_unload):
             return web.json_response({"unload_requested": request_unload(), "deferred": True})
@@ -1146,22 +1245,111 @@ async def media_manifest(request: web.Request) -> web.Response:
 
 @routes.get(f"{ROUTE_PREFIX}/media/{{asset_id}}/content")
 async def media_content(request: web.Request) -> web.StreamResponse:
+    headers = {}
     try:
         session_id = parse_session_id(request.query.get("session_id"))
         asset = STORE.get(session_id, request.match_info["asset_id"])
         kind = request.query.get("kind", "original")
-        if kind == "frame":
+        if kind == "workflow":
+            revision = int(request.query.get("revision", "-1"))
+            if revision != int(asset.get("content_revision", asset.get("sample_index", 0))):
+                raise web.HTTPConflict(text="Media changed during transfer. Drop the current version again.")
+            path = Path(asset.get("_edited_path") or asset["_original_path"])
+
+            def content_hash():
+                digest = hashlib.sha256()
+                with path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+                return digest.hexdigest()
+
+            try:
+                headers["X-H3PS-Content-Hash"] = await asyncio.to_thread(content_hash)
+            except OSError:
+                raise web.HTTPNotFound()
+            current = STORE.get(session_id, request.match_info["asset_id"])
+            if revision != int(current.get("content_revision", current.get("sample_index", 0))):
+                raise web.HTTPConflict(text="Media changed during transfer. Drop the current version again.")
+            headers["Cache-Control"] = "no-store"
+            # Windows can register MP3 as audio/mp3; workflow loaders expect the standard MIME type.
+            content_type = "audio/mpeg" if path.suffix.lower() == ".mp3" else mimetypes.guess_type(path.name)[0]
+            headers["Content-Type"] = content_type or "application/octet-stream"
+            filename = Path(asset.get("filename") or path.name).stem + path.suffix
+            headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(filename, safe='')}"
+        elif kind == "frame":
             index = int(request.query.get("index", "0"))
             path = Path(asset["_frames"][index]["path"])
         elif kind == "preview":
             path = Path(asset.get("_preview_path") or asset["_original_path"])
+        elif kind == "prepared":
+            if asset["type"] != "image":
+                raise MediaError("UNSUPPORTED_MEDIA", "Prepared visuals are available only for Picture assets.")
+            path = Path(asset.get("_prepared_path") or asset["_original_path"])
         elif kind == "sheet":
             path = Path(asset["_contact_sheet_path"])
-        else:
+        elif kind == "source":
             path = Path(asset["_original_path"])
+        elif kind == "editor_source":
+            path = Path(asset["_original_path"]).parent / ("editor_source.png" if asset["type"] == "image" else "editor_source.mp4")
+        else:
+            path = Path(asset.get("_edited_path") or asset["_original_path"])
     except (MediaError, ValueError, IndexError):
         raise web.HTTPNotFound()
-    return web.FileResponse(path)
+    return web.FileResponse(path, headers=headers)
+
+
+@routes.post(f"{ROUTE_PREFIX}/media/{{asset_id}}/edit")
+async def edit_media(request: web.Request) -> web.StreamResponse:
+    body = await _json_body(request)
+    if not isinstance(body, dict) or body.get("action") not in {"preview", "save", "download", "frame", "source", "audio"}:
+        return _error("INVALID_EDIT", "Select a valid media edit action.", status=400)
+    if not _claim_media_mutation():
+        return _error("GENERATION_BUSY", "Wait for the current Writer operation to finish.", status=409)
+    prepared = None
+    try:
+        session_id = parse_session_id(body.get("session_id"))
+        asset_id = request.match_info["asset_id"]
+        asset = dict(STORE.get(session_id, asset_id))
+        action = body["action"]
+        if action == "source":
+            _path, cancellation = await _run_thread_worker(browser_source, asset)
+            _propagate_worker_cancellation(cancellation)
+            return web.json_response({"url": STORE.public(asset)["source_url"].replace("kind=source", "kind=editor_source")})
+        if action == "frame":
+            if asset["type"] != "video":
+                raise MediaError("UNSUPPORTED_MEDIA", "Frame stepping requires a video.")
+            result, cancellation = await _run_thread_worker(video_frame, asset, body.get("time", 0), body.get("direction", 0), body.get("crop"), body.get("format") == "png")
+            _propagate_worker_cancellation(cancellation)
+            return web.json_response(result)
+        prepared, cancellation = await _run_thread_worker(prepare_edit, asset, body, action)
+        _propagate_worker_cancellation(cancellation)
+        if action == "preview":
+            return web.json_response(prepared)
+        if action == "save":
+            result = commit_edit(STORE, session_id, asset_id, prepared)
+            prepared = None
+            _invalidate_generation_cache(session_id, asset["mode"])
+            return web.json_response({"asset": result, "assets": STORE.list(session_id)})
+        target = prepared["target"]
+        response = web.StreamResponse(headers={"Content-Type": "audio/wav" if action == "audio" else "image/png" if asset["type"] == "image" else "video/mp4",
+                                              "Content-Disposition": f'attachment; filename="{target.name}"',
+                                              "Content-Length": str(target.stat().st_size)})
+        await response.prepare(request)
+        with target.open("rb") as source:
+            while chunk := await asyncio.to_thread(source.read, 1024*1024):
+                await response.write(chunk)
+        await response.write_eof()
+        return response
+    except (ValueError, TypeError, KeyError) as error:
+        return _error("INVALID_EDIT", "Invalid media edit parameters.", status=400)
+    except MediaError as error:
+        return _media_error(error, status=409 if error.code == "MEDIA_CHANGED" else 400)
+    finally:
+        try:
+            if prepared and prepared.get("directory"):
+                await _run_thread_worker(shutil.rmtree, prepared["directory"], ignore_errors=True)
+        finally:
+            _release_media_mutation()
 
 
 @routes.delete(f"{ROUTE_PREFIX}/media/{{asset_id}}")
@@ -1262,3 +1450,6 @@ async def reorder_media(request: web.Request) -> web.Response:
         return _media_error(error)
     _invalidate_generation_cache(session_id, body["mode"])
     return web.json_response({"assets": assets})
+
+
+register_sequence_routes(routes, sys.modules[__name__])
