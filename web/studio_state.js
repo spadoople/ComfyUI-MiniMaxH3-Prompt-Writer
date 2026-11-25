@@ -55,8 +55,7 @@ export function loadModeDrafts(storage = globalThis.localStorage) {
     return Object.fromEntries(DRAFT_MODES.flatMap((mode) => {
       const draft = value.drafts[mode];
       if (!draft || typeof draft.brief !== "string" || typeof draft.prompt !== "string") return [];
-      const briefLimit = mode === "Music3" ? 2000 : 8000;
-      const safeDraft = { brief: draft.brief.slice(0, briefLimit), prompt: draft.prompt.slice(0, 16000) };
+      const safeDraft = { brief: draft.brief, prompt: draft.prompt };
       if (mode === "Music3") safeDraft.lyrics = typeof draft.lyrics === "string" ? draft.lyrics.slice(0, 4000) : "";
       return [[mode, safeDraft]];
     }));
@@ -69,12 +68,16 @@ export function saveModeDrafts(storage, drafts) {
   const safeDrafts = Object.fromEntries(DRAFT_MODES.flatMap((mode) => {
     const draft = drafts?.[mode];
     if (!draft || typeof draft.brief !== "string" || typeof draft.prompt !== "string") return [];
-    const briefLimit = mode === "Music3" ? 2000 : 8000;
-    const safeDraft = { brief: draft.brief.slice(0, briefLimit), prompt: draft.prompt.slice(0, 16000) };
+    const safeDraft = { brief: draft.brief, prompt: draft.prompt };
     if (mode === "Music3") safeDraft.lyrics = typeof draft.lyrics === "string" ? draft.lyrics.slice(0, 4000) : "";
     return [[mode, safeDraft]];
   }));
-  storage?.setItem(MODE_DRAFTS_STORAGE_KEY, JSON.stringify({ version: 1, drafts: safeDrafts }));
+  try {
+    storage?.setItem(MODE_DRAFTS_STORAGE_KEY, JSON.stringify({ version: 1, drafts: safeDrafts }));
+  } catch (error) {
+    if (error?.name !== "QuotaExceededError") throw error;
+    // The editor keeps the current draft in memory when browser storage is full.
+  }
 }
 
 export function loadUserPreferences(storage = globalThis.localStorage) {
@@ -295,6 +298,7 @@ export function restoredModelAfterDiscovery(state) {
       ? state.externalModel
       : state.preferredProvider === "ollama"
         ? state.models.find((model) => model.family === "ollama" && model.remote_model === state.ollamaModelName && model.runtime_ready)
+          || state.models.find((model) => model.family === "ollama" && model.runtime_ready && model.capabilities?.images)
           || state.models.find((model) => model.family === "ollama" && model.runtime_ready)
         : null;
   return preferredProviderModel

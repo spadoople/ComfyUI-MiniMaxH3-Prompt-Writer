@@ -908,8 +908,12 @@ function updateBriefLayout() {
   const largeCanvas = window.innerWidth >= 3000 && window.innerHeight >= 1600;
   const minimumHeight = compactHeight ? 80 : largeCanvas ? 125 : 105;
   const maximumHeight = compactHeight ? 130 : largeCanvas ? 230 : 190;
-  const briefLimit = studio.mode === "Music3" ? 2000 : 8000;
-  brief.closest(".h3ps-brief").querySelector(".h3ps-char-count").textContent = `${brief.value.length.toLocaleString()} / ${briefLimit.toLocaleString()}`;
+  const briefLimit = studio.selectedModel?.family === "ollama" ? null : studio.mode === "Music3" ? 2000 : 8000;
+  if (briefLimit === null) brief.removeAttribute("maxlength");
+  else brief.maxLength = briefLimit;
+  const count = brief.value.length.toLocaleString();
+  brief.closest(".h3ps-brief").querySelector(".h3ps-char-count").textContent =
+    briefLimit === null ? `${count} characters` : `${count} / ${briefLimit.toLocaleString()}`;
   brief.style.height = "auto";
   brief.style.height = `${fullscreen ? Math.max(minimumHeight, brief.scrollHeight) : Math.min(maximumHeight, Math.max(minimumHeight, brief.scrollHeight))}px`;
   brief.style.overflowY = !fullscreen && brief.scrollHeight > maximumHeight ? "auto" : "hidden";
@@ -1555,7 +1559,10 @@ function ollamaModelForSettings() {
   if (studio.selectedModel?.family === "ollama" && studio.selectedModel.endpoint === studio.ollamaHost) {
     return models.find((model) => model.id === studio.selectedModel.id) || studio.selectedModel;
   }
-  return models.find((model) => model.remote_model === studio.ollamaModelName) || models[0] || null;
+  return models.find((model) => model.remote_model === studio.ollamaModelName)
+    || models.find((model) => model.capabilities?.images)
+    || models[0]
+    || null;
 }
 
 function ollamaHostControlMarkup() {
@@ -1633,26 +1640,33 @@ function renderOllamaProviderControl() {
     </div>${hostControl}`;
   }
   const models = ollamaModels();
+  const selected = ollamaModelForSettings();
+  const installedModels = Array.isArray(status.models) ? status.models : models;
+  const modelOptions = installedModels.map((model) => {
+    const availability = model.runtime_ready ? (model.capabilities?.images ? "Vision" : "Text only") : "Unavailable for prompting";
+    return `<option value="${escapeHtml(model.remote_model)}" ${model.runtime_ready ? "" : "disabled"} ${model.remote_model === selected?.remote_model ? "selected" : ""}>${escapeHtml(model.name)}${model.parameter_size ? ` · ${escapeHtml(model.parameter_size)}` : ""}${model.quantization_level ? ` · ${escapeHtml(model.quantization_level)}` : ""} · ${availability}</option>`;
+  }).join("");
+  const modelPicker = `<label class="h3ps-ollama-model-select"><select data-ollama-model aria-label="Installed Ollama models" ${models.length ? "" : "disabled"}>${modelOptions}</select></label>`;
   if (!models.length) {
     return `${header}${ollamaJourneyMarkup("model")}<div class="h3ps-ollama-state h3ps-ollama-model-state">
       <span class="h3ps-ollama-state-copy"><strong>Add a compatible prompt model</strong>
-      <p>Ollama is running, but no installed model reports both vision and text generation support.</p>
+      <p>Ollama is running, but no installed model reports text generation support.</p>
+      ${installedModels.length ? modelPicker : ""}
       <div class="h3ps-ollama-tier-heading">Choose a model for your GPU</div>
       ${renderOllamaModelTiers(status)}
       <small>Copy a command and run it in Terminal or PowerShell. This page detects the model automatically.</small>
       <details class="h3ps-ollama-storage-help" data-ollama-storage-help ${studio.ollamaStorageHelpOpen ? "open" : ""}><summary>Need models on another drive?</summary><p>Ollama manages one global model store. Set <code>OLLAMA_MODELS</code> before pulling a model, then restart Ollama. <a href="https://docs.ollama.com/windows#changing-model-location" target="_blank" rel="noopener noreferrer">Official instructions ↗</a></p></details></span>
     </div>${hostControl}`;
   }
-  const selected = ollamaModelForSettings();
   const tested = selected?.tested_for_h3 === true;
   const addModelOpen = studio.ollamaAddModelOpen === true;
   return `${header}${ollamaJourneyMarkup("ready")}<div class="h3ps-ollama-ready">
     <div class="h3ps-ollama-ready-heading"><span class="h3ps-provider-icon" data-provider-icon="ollama" aria-hidden="true"></span><span><strong>Ollama is ready</strong><small>Version ${escapeHtml(status.version || "unknown")} · ${remoteHost ? escapeHtml(studio.ollamaHost) : "local service"}</small></span><em>Running</em></div>
     <div class="h3ps-ollama-model-heading"><span>Prompt model</span><button class="h3ps-ollama-add-model-toggle" type="button" data-ollama-add-model aria-expanded="${String(addModelOpen)}">${addModelOpen ? "− Hide models" : "+ Add model"}</button></div>
-    <label class="h3ps-ollama-model-select"><select data-ollama-model>${models.map((model) => `<option value="${escapeHtml(model.remote_model)}" ${model.remote_model === selected?.remote_model ? "selected" : ""}>${escapeHtml(model.name)}${model.parameter_size ? ` · ${escapeHtml(model.parameter_size)}` : ""}${model.quantization_level ? ` · ${escapeHtml(model.quantization_level)}` : ""}</option>`).join("")}</select></label>
+    ${modelPicker}
     ${addModelOpen ? `<div class="h3ps-ollama-add-model"><strong>Choose another tested model</strong>${renderOllamaModelTiers(status)}<small>Copy a command and run it in Terminal or PowerShell. Select Refresh after the pull completes.</small></div>` : ""}
-    <div class="h3ps-ollama-badges"><span>Vision</span><span>${selected?.thinking_detected ? "Thinking detected" : "Standard generation"}</span><span class="${tested ? "is-tested" : ""}">${tested ? "Tested for H3" : "Compatible · not yet H3-tested"}</span></div>
-    <p>${tested ? "This exact Ollama tag passed the focused H3 Generate and Refine smoke test." : "Compatibility comes from Ollama model metadata. It is not a quality guarantee for H3 prompts."}</p>
+    <div class="h3ps-ollama-badges"><span>${selected?.capabilities?.images ? "Vision" : "Text only"}</span><span>${selected?.thinking_detected ? "Thinking detected" : "Standard generation"}</span><span class="${tested ? "is-tested" : ""}">${tested ? "Tested for H3" : "Compatible · not yet H3-tested"}</span></div>
+    <p>${tested ? "This exact Ollama tag passed the focused H3 Generate and Refine smoke test." : selected?.capabilities?.images ? "Compatibility comes from Ollama model metadata." : "Use this model for text-only prompts. Select a vision model to work with images or video."}</p>
     <small>Use “Keep model loaded” on the Generate page to control whether Ollama retains this model after each request.</small>
   </div>${hostControl}`;
 }
@@ -1963,6 +1977,7 @@ function selectModel(model, { preserveSettingsProvider = false } = {}) {
   keepLoaded.checked = studio.keepModelLoaded;
   renderInferenceSettings();
   renderMedia(studio.mode);
+  updateBriefLayout();
   setOtherModelsPopover(false);
   syncRuntimeSummary();
   syncThinkingAvailability();
@@ -2132,8 +2147,8 @@ function syncRuntimeSummary(result = null) {
     const tokens = result?.context_tokens || studio.selectedModel.server_context_tokens;
     activeSummary = tokens ? `Server · ${Math.round(tokens / 1024)}K` : "Server managed";
   } else if (studio.selectedModel?.family === "ollama") {
-    const tokens = result?.context_tokens || (studio.contextProfile === "auto" ? null : ({ low: 8192, standard: 16384, extended: 24576, large: 32768, maximum: 49152 }[studio.contextProfile]));
-    activeSummary = tokens ? `Ollama · ${Math.round(tokens / 1024)}K` : "Ollama · Auto";
+    const tokens = result?.context_tokens || studio.selectedModel.model_context_limit;
+    activeSummary = tokens ? `Ollama · ${tokens.toLocaleString()} tokens` : "Ollama · Auto";
   } else if (studio.selectedModel?.family === "api") {
     const tokens = result?.context_limit_known ? result.context_tokens : studio.selectedModel.model_context_limit;
     activeSummary = tokens ? `API · ${Math.round(tokens / 1024)}K` : "API · Provider managed";

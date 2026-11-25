@@ -465,15 +465,16 @@ test("all mode drafts persist independently across reloads", () => {
   assert.deepEqual(createStudioState({ sessionId: "drafts", storage }).modeDrafts.T2VA, { brief: "Text brief", prompt: "Text prompt" });
 });
 
-test("video drafts preserve the 8000 character brief while Music keeps 2000", () => {
+test("drafts preserve long briefs and generated prompts", () => {
   const storage = memoryStorage();
   saveModeDrafts(storage, {
-    T2VA: { brief: "v".repeat(8000), prompt: "Video prompt" },
+    T2VA: { brief: "v".repeat(32_000), prompt: "p".repeat(25_000) },
     Music3: { brief: "m".repeat(8000), prompt: "Music prompt", lyrics: "Lyrics" },
   });
   const drafts = loadModeDrafts(storage);
-  assert.equal(drafts.T2VA.brief.length, 8000);
-  assert.equal(drafts.Music3.brief.length, 2000);
+  assert.equal(drafts.T2VA.brief.length, 32_000);
+  assert.equal(drafts.T2VA.prompt.length, 25_000);
+  assert.equal(drafts.Music3.brief.length, 8000);
 });
 
 test("draft dirty state covers every mode", () => {

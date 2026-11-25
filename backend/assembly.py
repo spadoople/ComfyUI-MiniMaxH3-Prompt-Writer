@@ -65,7 +65,7 @@ def _validate_reference_tags(text: str, manifest: dict[str, Any], mode: str, fie
         )
 
 
-def _validated_generation_context(source: dict[str, Any]) -> tuple[float, str, str]:
+def _validated_generation_context(source: dict[str, Any], *, long_text: bool = False) -> tuple[float, str, str]:
     duration = source.get("duration_seconds")
     if not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration <= 0 or duration > 20:
         raise AssemblyError("INVALID_DURATION", "Duration must be between 1 and 20 seconds.")
@@ -73,14 +73,14 @@ def _validated_generation_context(source: dict[str, Any]) -> tuple[float, str, s
     if aspect_ratio not in ASPECT_RATIOS:
         raise AssemblyError("INVALID_ASPECT_RATIO", "The selected aspect ratio is not supported.")
     brief = _required_text(source, "creative_brief", "Creative brief")
-    if len(brief) > 8000:
+    if not long_text and len(brief) > 8000:
         raise AssemblyError("BRIEF_TOO_LONG", "Creative brief cannot exceed 8,000 characters.")
     return duration, aspect_ratio, brief
 
 
 def _validated_music_caption_context(source: dict[str, Any]) -> tuple[str, str]:
     brief = _required_text(source, "creative_brief", "Music brief")
-    if len(brief) > 2000:
+    if not source.get("ollama_model") and len(brief) > 2000:
         raise AssemblyError("BRIEF_TOO_LONG", "Music brief cannot exceed 2,000 characters.")
     lyrics = source.get("lyrics", "")
     if not isinstance(lyrics, str):
@@ -185,7 +185,7 @@ def assemble_request(body: dict[str, Any]) -> dict[str, Any]:
         raise AssemblyError("INVALID_MODE", "The selected MiniMax mode is not supported.")
     system_prompt, system_prompt_custom = _effective_system_prompt(body, mode)
     brief = _required_text(body, "creative_brief", "Creative brief")
-    if len(brief) > 8000:
+    if not body.get("ollama_model") and len(brief) > 8000:
         raise AssemblyError("BRIEF_TOO_LONG", "Creative brief cannot exceed 8,000 characters.")
 
     aspect_ratio = _required_text(body, "aspect_ratio", "Aspect ratio")
@@ -265,13 +265,14 @@ def assemble_refinement(
     cached_generation: dict[str, Any] | None,
 ) -> dict[str, Any]:
     mode = _required_text(body, "mode", "Mode")
+    long_text = bool(body.get("ollama_model"))
     if mode == MUSIC3_MODE:
         system_prompt, system_prompt_custom = _effective_system_prompt(body, mode)
         current_prompt = _required_text(body, "current_prompt", "Current caption")
         instruction = _required_text(body, "instruction", "Revision instruction")
-        if len(current_prompt) > 20_000:
+        if not long_text and len(current_prompt) > 20_000:
             raise AssemblyError("PROMPT_TOO_LONG", "The current caption cannot exceed 20,000 characters.")
-        if len(instruction) > 2_000:
+        if not long_text and len(instruction) > 2_000:
             raise AssemblyError("INSTRUCTION_TOO_LONG", "The revision instruction cannot exceed 2,000 characters.")
         try:
             session_id = parse_session_id(body.get("session_id"))
@@ -308,9 +309,9 @@ def assemble_refinement(
     system_prompt, system_prompt_custom = _effective_system_prompt(body, mode)
     current_prompt = _required_text(body, "current_prompt", "Current prompt")
     instruction = _required_text(body, "instruction", "Revision instruction")
-    if len(current_prompt) > 20_000:
+    if not long_text and len(current_prompt) > 20_000:
         raise AssemblyError("PROMPT_TOO_LONG", "The current prompt cannot exceed 20,000 characters.")
-    if len(instruction) > 2_000:
+    if not long_text and len(instruction) > 2_000:
         raise AssemblyError("INSTRUCTION_TOO_LONG", "The revision instruction cannot exceed 2,000 characters.")
     try:
         session_id = parse_session_id(body.get("session_id"))
@@ -321,7 +322,7 @@ def assemble_refinement(
     if not manifest["valid"]:
         raise AssemblyError("INVALID_MEDIA_MANIFEST", "The media manifest is not valid.", manifest["violations"])
     context_source = cached_generation if cached_generation and cached_generation.get("mode") == mode else body
-    duration, aspect_ratio, creative_brief = _validated_generation_context(context_source)
+    duration, aspect_ratio, creative_brief = _validated_generation_context(context_source, long_text=long_text)
     _validate_reference_tags(creative_brief, manifest, mode, "Creative Brief")
     _validate_reference_tags(instruction, manifest, mode, "Revision instruction")
     references = "\n".join(_media_line(asset) for asset in manifest["assets"]) or "None"
@@ -392,9 +393,9 @@ def assemble_lyrics_request(body: dict[str, Any]) -> dict[str, Any]:
     brief = normalize_unicode_text(brief).strip() if use_music_brief else ""
     if len(current_lyrics) > 4000:
         raise AssemblyError("LYRICS_TOO_LONG", "Lyrics cannot exceed 4,000 characters.")
-    if len(instruction) > 2000:
+    if not body.get("ollama_model") and len(instruction) > 2000:
         raise AssemblyError("INSTRUCTION_TOO_LONG", "The revision instruction cannot exceed 2,000 characters.")
-    if len(brief) > 2000:
+    if not body.get("ollama_model") and len(brief) > 2000:
         raise AssemblyError("BRIEF_TOO_LONG", "Music brief cannot exceed 2,000 characters.")
     if current_lyrics and not instruction:
         raise AssemblyError("INSTRUCTION_REQUIRED", "Describe how the existing Lyrics should change.")

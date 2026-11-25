@@ -15,6 +15,8 @@ Ollama is the recommended local provider. It keeps the prompt-model runtime outs
 
 Prompt Writer only checks the selected Ollama service and its installed models. It does not start `ollama serve`, call `/api/pull`, or download models.
 
+The picker lists installed models and enables those that report text generation support. Text-only models work for prompts without visual references. Choose a vision model for images or video. Embedding-only models are listed as unavailable for prompting.
+
 ## Ollama on another computer
 
 The default host is `http://127.0.0.1:11434`. To use Ollama on another computer, open the collapsed **Use Ollama on another computer** control in Ollama Settings and enter that server's root URL, such as `http://192.168.1.25:11434`.
@@ -45,9 +47,9 @@ You can try other Ollama vision models when Ollama reports the required image ca
 
 ## Context and Thinking
 
-Ollama has no manual Context or KV cache controls in Writer. Writer estimates the assembled request and sends the smallest sufficient 8K, 16K, or 24K `num_ctx` value, within the selected model's reported limit. Ollama decides the actual GPU and CPU placement.
+Writer requests the full context window reported by the selected Ollama model. The prompt, prepared media and generated text share that window. Writer estimates the space used by the request and makes the remaining space available for generation. If the model does not report a context window, Writer uses its existing automatic context tiers. Ollama manages the KV cache and GPU and CPU placement.
 
-The **Thinking** switch is available only when the selected Ollama model reports thinking support. When enabled, Auto reserves the larger reasoning and final-output budget before choosing context.
+The **Thinking** switch is available when the selected Ollama model reports thinking support. Reasoning and the final response share the output budget.
 
 ## Model lifecycle
 

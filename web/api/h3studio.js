@@ -8,11 +8,12 @@ async function request(path, options) {
   return readApiResponse(response);
 }
 
-function post(path, body = {}) {
+function post(path, body = {}, options = {}) {
   return request(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    ...options,
   });
 }
 
@@ -31,10 +32,10 @@ export const getGuides = () => request("/guides");
 export const getGuide = (mode) => request(`/guides/${encodeURIComponent(mode)}`);
 export const getSystemPrompt = (mode) => request(`/system-prompt/${encodeURIComponent(mode)}`);
 export const assemble = (payload) => post("/assemble", payload);
-export const generate = (payload) => post("/generate", payload);
+export const generate = (payload) => post("/generate", payload, payload.ollama_model ? { timeoutMs: null } : undefined);
 export const cancel = () => post("/cancel");
 export const unloadModel = (target = {}) => post("/unload", target);
-export const refine = (payload) => post("/refine", payload);
+export const refine = (payload) => post("/refine", payload, payload.ollama_model ? { timeoutMs: null } : undefined);
 
 export async function freeComfyVram() {
   const response = await api.fetchApi("/free", {
