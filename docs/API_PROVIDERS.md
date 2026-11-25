@@ -52,6 +52,22 @@ For another Custom endpoint, enable **Endpoint accepts image_url inputs** only w
 
 Custom is a transport contract, not a claim that every OpenAI-compatible server or model is supported.
 
+## Claude through Custom
+
+Choose **Custom**, enter `https://api.anthropic.com/v1`, and paste an Anthropic API key scoped to a single workspace. Connect, then select a Claude model. Enable **Endpoint accepts image_url inputs** when using a vision-capable model with image references.
+
+Writer supplies the required `anthropic-version` header and uses Anthropic's [OpenAI-compatible Chat Completions endpoint](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk). Native Claude thinking and prompt-cache controls are not exposed through this setup.
+
+Model discovery and multimodal streaming are covered by local HTTP contract tests. A credentialed live Anthropic smoke test has not been run.
+
+## Sampling controls
+
+After connecting, expand **Sampling** to set Temperature, Top P, Top K, Frequency penalty, and Presence penalty where supported. Save applies to the next Generate or Refine request, including follow-up repairs. Empty fields and **Reset to provider defaults** omit the corresponding parameters from API requests; local GGUF/Ollama sampler defaults are not sent to API providers.
+
+OpenRouter controls follow the selected model's `supported_parameters`. Custom endpoints use reported metadata when available; otherwise all five optional overrides are offered, and the endpoint may reject unsupported settings. OpenAI and Gemini remain provider-managed unless model metadata explicitly advertises sampling controls. Anthropic through Custom remains provider-managed. Disabled fields are not sent.
+
+Sampling values are saved locally with the API configuration. Changing the model or provider clears overrides so settings for one model do not silently carry over to another.
+
 ## Keys and saved settings
 
 The key is sent once to the local H3 backend and held only in the current Writer backend process's memory. It is not read from environment variables and is not written to browser storage, model settings, developer notes, or request content. The backend uses it only to authenticate provider requests. Disconnecting removes the in-memory connection. The browser may save the preset, base URL, model ID, Gemini Thinking level, and Custom capability settings.

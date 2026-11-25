@@ -109,6 +109,20 @@ class MediaTransactionTests(unittest.TestCase):
             self.assertFalse((root / "old").exists())
             self.assertTrue(incoming.exists())
 
+    def test_reference_delete_and_reorder_match_active_input_positions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = [self.asset(root, f"p{i}", "Reference", "image", f"<Picture {i}>") for i in range(1, 5)]
+            store = media.MediaStore()
+            store.sessions["session"] = assets
+            store.remove("session", "p1")
+            store.remove("session", "p2")
+            self.assertEqual([(a["id"], a["reference"]) for a in store.manifest("session", "Reference")["assets"]],
+                             [("p3", "<Picture 1>"), ("p4", "<Picture 2>")])
+            store.reorder("session", "Reference", ["p4", "p3"])
+            self.assertEqual([(a["id"], a["reference"]) for a in store.manifest("session", "Reference")["assets"]],
+                             [("p4", "<Picture 1>"), ("p3", "<Picture 2>")])
+
     def test_reference_replace_can_change_media_type_without_moving_the_slot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -226,6 +240,21 @@ class MediaTransactionTests(unittest.TestCase):
 
             self.assertEqual(media_type, "image/jpeg")
             self.assertEqual(payload, b"prepared-image")
+
+    def test_public_image_exposes_the_prepared_visual_for_local_composition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = self.asset(root, "image", "Reference", "image", "<Picture 1>")
+            prepared = Path(image["_original_path"]).parent / "prepared.jpg"
+            prepared.touch()
+            image["_prepared_path"] = str(prepared)
+
+            result = media.MediaStore().public(image)
+
+            self.assertEqual(
+                result["prepared_url"],
+                "/h3studio/media/image/content?session_id=session&kind=prepared&revision=0",
+            )
 
     def test_model_visual_rejects_registered_paths_outside_writer_cache(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside_directory:

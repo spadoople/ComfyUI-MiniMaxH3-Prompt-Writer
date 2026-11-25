@@ -104,6 +104,53 @@ class ModelDiscoveryTests(unittest.TestCase):
         ):
             return catalog.find_model(str(model_path.resolve()))
 
+    def test_registered_roots_support_discovery_and_lookup_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "gemma-4-test-Q4.gguf"
+            write_model(model)
+            write_projector(root / "mmproj-BF16.gguf")
+            for categories in (("LLM",), ("llm",), ("LLM", "llm"), ()):
+                registered = {name: ([str(root)], set()) for name in categories}
+                with (
+                    self.subTest(categories=categories),
+                    patch.object(catalog.folder_paths, "get_folder_paths",
+                                 side_effect=lambda name: registered[name][0][:]),
+                    patch.object(catalog.importlib.util, "find_spec", return_value=object()),
+                    patch.object(catalog, "_runtime_version", return_value="0.3.35"),
+                ):
+                    models, diagnostics = catalog.discover_models_with_diagnostics()
+                    self.assertEqual(len(models), int(bool(categories)))
+                    self.assertEqual(len(diagnostics["roots"]), int(bool(categories)))
+                    if categories:
+                        self.assertEqual(diagnostics["roots"][0]["path"], str(root.resolve()))
+                        self.assertIsNotNone(catalog.find_model(str(model)))
+                    else:
+                        self.assertIsNone(catalog.find_model(str(model)))
+                    self.assertIsNone(catalog.find_model(str(root.parent / "outside.gguf")))
+
+    def test_explicit_projector_is_validated_without_changing_automatic_pairing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "gemma-4-test-Q4.gguf"; write_model(model)
+            first, second = root / "mmproj-A.gguf", root / "mmproj-B.gguf"
+            write_projector(first); write_projector(second)
+            with (
+                patch.object(catalog.folder_paths, "get_folder_paths", return_value=[str(root)]),
+                patch.object(catalog.importlib.util, "find_spec", return_value=object()),
+                patch.object(catalog, "_runtime_version", return_value="0.3.35"),
+            ):
+                automatic = catalog.find_model(str(model))
+                self.assertIsNone(automatic["projector"])
+                selected = catalog.resolve_projector(str(model), str(second))
+                self.assertEqual(selected["projector"], str(second.resolve()))
+                self.assertTrue(selected["capabilities"]["images"])
+                self.assertEqual(len(selected["projector_candidates"]), 2)
+                self.assertIsNone(catalog.find_model(str(model))["projector"])
+                self.assertIsNone(catalog.resolve_projector(str(model), str(model)))
+                second.unlink()
+                self.assertIsNone(catalog.resolve_projector(str(model), str(second)))
+
     def test_single_flat_pair_is_paired_automatically(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -177,7 +224,7 @@ class ModelDiscoveryTests(unittest.TestCase):
         self.assertIsNone(model["projector"])
         self.assertTrue(model["runtime_ready"])
         self.assertEqual(model["vision_status"], "ambiguous")
-        self.assertIn("Keep only the intended projector", model["capability_message"])
+        self.assertIn("Move each model and its intended projector into its own subfolder", model["capability_message"])
 
     def test_separate_subfolders_pair_locally(self):
         with tempfile.TemporaryDirectory() as directory:

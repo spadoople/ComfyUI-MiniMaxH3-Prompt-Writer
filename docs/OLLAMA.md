@@ -45,7 +45,7 @@ You can try other Ollama vision models when Ollama reports the required image ca
 
 ## Context and Thinking
 
-Ollama has no manual Context or KV cache controls in Writer. Writer estimates the assembled request and sends the smallest sufficient 8K, 16K, or 24K `num_ctx` value, within the selected model's reported limit. Ollama decides the actual GPU and CPU placement.
+Leave **Context (tokens)** empty for Auto. Writer estimates the assembled request and selects 8K, 16K, or 24K. To use less memory or fit a larger Sequence, enter an exact token count, including values above 24K. Writer sends it as `num_ctx` and checks that the input and reply fit within it and that it respects the model's reported limit. Ollama controls KV cache and GPU/CPU placement.
 
 The **Thinking** switch is available only when the selected Ollama model reports thinking support. When enabled, Auto reserves the larger reasoning and final-output budget before choosing context.
 
@@ -60,3 +60,7 @@ With **Keep model loaded** off, Writer asks Ollama to unload the model after the
 Ollama is a shared service. Writer only offers unload controls for models it intentionally used and retained during the current Writer session. Retained-model state is tracked separately for each configured host.
 
 See [Troubleshooting](TROUBLESHOOTING.md#ollama-is-not-running) if the service or model is not detected.
+
+**Generation budget** in Settings sets the output token limit, including thinking.
+Auto keeps the default budget. Choose a preset or Custom when a response reaches
+its limit. The input, reply budget, and safety reserve must fit the context.

@@ -2,7 +2,7 @@
 
 This page primarily covers the ComfyUI extension. Standalone users should start with the [Standalone setup guide](../standalone/README.md). The `llama-cpp-python` and ComfyUI VRAM instructions below do not apply to Standalone Local GGUF.
 
-Start by updating H3 Prompt Writer, restarting ComfyUI, and using `Ctrl+F5` if the browser still shows an older interface. The entries below describe problems that can still occur in v0.4.3.
+Start by updating H3 Prompt Writer, restarting ComfyUI, and using `Ctrl+F5` if the browser still shows an older interface.
 
 ## I installed it but cannot find a node
 
@@ -37,7 +37,7 @@ Direct uses an optional native runtime. ComfyUI Manager installs the base extens
 For the NVIDIA Windows Portable build used for v0.3 validation, open a terminal in the folder containing `python_embeded` and run:
 
 ```powershell
-.\python_embeded\python.exe -m pip install --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130 "llama-cpp-python>=0.3.35,<0.4"
+.\python_embeded\python.exe -m pip install --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130 "llama-cpp-python==0.3.35"
 ```
 
 Restart ComfyUI.
@@ -62,7 +62,7 @@ From the Windows Portable folder containing `python_embeded`, perform one clean 
 
 ```powershell
 .\python_embeded\python.exe -m pip uninstall llama-cpp-python -y
-.\python_embeded\python.exe -m pip install --no-cache-dir --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130 "llama-cpp-python>=0.3.35,<0.4"
+.\python_embeded\python.exe -m pip install --no-cache-dir --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130 "llama-cpp-python==0.3.35"
 ```
 
 Do not install into system Python, copy native DLLs manually, or replace ComfyUI's embedded Python files.
@@ -269,17 +269,39 @@ For Direct Auto, let Writer select a supported preset. If a manual Context or Ge
 
 For actual memory failure, use **Free ComfyUI VRAM**, close other GPU-heavy applications, select a smaller model, or reduce context. Do not increase context as a generic response to an OOM.
 
-Ollama context is automatic in Writer; Ollama decides whether to offload parts of the model to CPU/RAM.
+For Ollama, leave **Context (tokens)** empty for Auto or enter a value within the model's limit. A smaller value can reduce memory use if the request still fits. Ollama decides whether to offload parts of the model to CPU/RAM.
 
 **Verify**
 
 The next request completes without a context-limit or allocation error. If Thinking falls back, Writer reports it instead of presenting it as a full Thinking result.
 
+## Sequence stops or repeats an action
+
+**Symptom**
+
+Sequence stops partway through generation, marks a prompt with an orange attention icon, or produces an action with poor continuity or pacing.
+
+**Cause**
+
+The model may return an incomplete plan, unsupported prompt structure, or ambiguous local timestamp. A valid plan can still distribute action poorly. The plan, preceding prompt, official guide, and references also consume context.
+
+**Fix**
+
+Review the brief and Chunk Direction. Make required event order or endpoint explicit, then regenerate the affected chunks. Open-ended activity does not need an invented endpoint. An incomplete or ambiguous plan stops generation without fallback. The message identifies missing steps, a missing ending, or unreadable JSON. Run Generate Sequence again. Technical details show the exact planner failure. A redundant interval number is ignored only when it matches the requested interval. A repairable H3 format problem gets one automatic correction. If it still needs attention, the model output stays visible and later chunks are not started. Select the orange icon for the model error and a suggested fix. Use Refine, Regenerate, or edit the text yourself. A manual edit clears that old warning. Completed chunks survive cancellation or a later failure; previous versions remain in Undo/Redo. If one model repeatedly fails, try another supported model.
+
+For context errors, increase the supported Context or reduce Generation budget or reference load. Writer does not silently truncate continuity evidence. Do not increase context for a VRAM allocation failure; follow the memory guidance above.
+
+If a chunk exceeds its context after planning, its error shows the shortfall and the estimated context needed for that chunk, including the plan, preceding prompt, reply and safety margin. When the provider lets you increase context, use the suggested size and retry with the same brief and references. If the model's limit is too small, reduce the input or use a model with a larger context window.
+
+**Verify**
+
+Each chunk starts from the preceding accepted state, keeps timestamps local, and completes only its intended action. Check reference tags and natural pacing yourself. See [Sequence usage](USAGE.md#sequence) for media scope and editing behavior.
+
 ## Reference prompt warning
 
 **Symptom**
 
-Writer says it repaired a missing reference tag or kept the original prompt with a format warning.
+Single mode says it repaired a missing reference tag or kept the original prompt with a format warning. Sequence has its own single contract correction and chunk-local attention indicator; see the section above.
 
 **Cause**
 

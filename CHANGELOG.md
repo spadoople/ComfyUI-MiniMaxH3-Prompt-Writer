@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.8 - 2026-10-28
+
+- Fixed generation and Refine failing with `Fetch timeout` after one minute on newer ComfyUI frontends ([#49](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/49)).
+- Improved Direct GGUF cancellation with native runtime abort support, avoiding a Python callback on every token. Thanks to @Bloodborne9876 ([#39](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/pull/39)).
+- Fixed compatibility with Anthropic's OpenAI-compatible API endpoint ([#41](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/41)).
+- Fixed GGUF model discovery when optional ComfyUI model folders are not registered ([#43](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/43)).
+- Added optional sampling controls for API providers, with saved overrides and a reset to provider defaults ([#44](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/44)).
+- Added a setting to hide the H3 launcher button while keeping Writer available through the Extensions menu ([#46](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/46)).
+- Improved Media Panel drops onto custom media loaders, using each loader's own upload and preview handling ([#37](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/37)).
+
+## 0.4.7 - 2026-09-26
+
+- Fixed ComfyUI keyboard shortcuts remaining blocked after closing Writer's media tools, and made the launcher's keyboard focus easier to see ([#36](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/issues/36)).
+- Added Save/Load text drafts for Single and Sequence, plus audio extraction from video selections.
+- Added an Ollama generation budget and a manual Direct GGUF projector selector.
+- Removed the video Creative Brief character limit and improved long-text editing.
+- Fixed Single Reference numbering after deleting or reordering media.
+
+## 0.4.6 - 2026-09-09
+
+- Added **Sequence mode**: turn one brief into a series of timed clips with consistent action and references. Each clip gets its own complete prompt and can be edited separately.
+- Added **Compact mode** for Sequence.
+- Fixed Direct GGUF model loading with newer compatible runtimes. Thanks to @Bloodborne9876 ([#25](https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/pull/25)).
+- Also improved draft saving, model switching and generation reliability, fixed video playback controls, enabled text-only Music 3, and added a Linux launcher for Standalone.
+
+## 0.4.5 - 2026-09-06
+
+### Features
+
+- Media Composer for collages from pictures and video contact sheets.
+- Media Editor for picture crops, video trims and crops, and frame extraction.
+- Floating Media panel for dragging media into ComfyUI workflows.
+- Light theme and adjustable interface size.
+- Auto VRAM management.
+- Model switching and unloading for supported External llama.cpp routers.
+
+## 0.4.4 - 2026-09-02
+
+### Features
+
+- Added optional **Auto VRAM** coordination between ComfyUI workflows and Writer-managed Direct GGUF or local Ollama models.
+- Added a compact Clear menu for clearing prompts while keeping media, or clearing the entire workspace.
+- Added custom 2–16 frame contact sheets with more readable frame labels.
+
+### Fixes
+
+- Allowed private-network Ollama hostnames while pinning the validated address, and preserved unsaved host edits during background refreshes.
+- Pinned the tested Windows CUDA 13 install and recovery guidance to `llama-cpp-python 0.3.35`.
+- Skipped unnecessary ComfyUI VRAM release polling when no workflow models are loaded.
+
 ## 0.4.3 - 2026-08-29
 
 ### Features
