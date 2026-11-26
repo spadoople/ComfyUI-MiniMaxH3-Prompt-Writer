@@ -1,5 +1,6 @@
 const IMAGE_LOADERS = new Set(["LoadImage", "LoadImageOutput"]);
 const IMAGE_OUTPUTS = new Set(["PreviewImage", "SaveImage"]);
+const CONVEYOR_NODES = new Set(["ImageConveyor", "SequentialBatchImageLoader"]);
 
 function loaderImage(node, type) {
   return imageLocation(node.widgets?.find(widget => widget.name === "image")?.value,
@@ -24,6 +25,76 @@ function imageLocation(path, folder = "input", subfolder = "") {
   return { filename, subfolder: [subfolder, ...parts].filter(Boolean).join("/"), type: folder };
 }
 
+function conveyorState(node) {
+  const value = node.widgets?.find(widget => widget.name === "state_json")?.value;
+  try {
+    const state = JSON.parse(value);
+    return state && typeof state === "object" && !Array.isArray(state) ? state : null;
+  } catch {
+    return null;
+  }
+}
+
+function conveyorImage(entry) {
+  // annotated identifies the stored ComfyUI copy. source_path can refer to an external original.
+  const path = typeof entry?.annotated === "string" ? entry.annotated.trim().replaceAll("\\", "/") : "";
+  const location = imageLocation(path, entry?.type || "input");
+  if (!location || /^[a-z]:/i.test(path)) return null;
+  const relativePath = path.replace(/ \[(input|output|temp)\]$/, "");
+  if (relativePath.split("/").some(part => !part || part === "." || part === "..")) return null;
+  return location;
+}
+
+function hasConveyorShelf(state) {
+  // Older workflows inferred queue-group mode from the group size.
+  return Object.hasOwn(state, "output_mode")
+    ? String(state.output_mode).trim().toLowerCase() !== "queue_group"
+    : !(Number(state.images_per_execution) > 1);
+}
+
+function conveyorRefEnabled(node, state, index) {
+  const switches = node.properties?.image_conveyor_reference_enabled ?? state.reference_output_enabled;
+  return switches?.[index] !== false;
+}
+
+function conveyorCanvasSources(node, label, selected) {
+  const state = conveyorState(node);
+  if (!state) return [];
+  const shelf = hasConveyorShelf(state) && Array.isArray(state.reference_slots) ? state.reference_slots : [];
+  const queue = Array.isArray(state.items) ? state.items : [];
+  return [
+    ...shelf.flatMap((entry, index) => {
+      const source = conveyorImage(entry);
+      if (!source) return [];
+      const enabled = conveyorRefEnabled(node, state, index);
+      return [{ ...source, label: `${label} · Ref ${index + 1}${enabled ? "" : " (off)"}`, selected: selected && enabled }];
+    }),
+    ...queue.flatMap((entry, index) => {
+      const source = conveyorImage(entry);
+      return source ? [{ ...source, label: `${label} · Queue ${index + 1}`, selected: false }] : [];
+    }),
+  ];
+}
+
+function conveyorConditioningSource(node, outputSlot, label) {
+  const state = conveyorState(node);
+  if (!state) throw new Error(`${label} has no readable Conveyor state`);
+  const outputName = node.outputs?.[outputSlot]?.name;
+  const match = outputName?.match(/^ref_image_([1-8])$/);
+  if (!hasConveyorShelf(state) || !match) {
+    const toggle = outputName === "image" ? ["image_conveyor_main_enabled", "main_output_enabled"]
+      : outputName === "last_frame" ? ["image_conveyor_last_frame_enabled", "last_frame_output_enabled"] : null;
+    if (hasConveyorShelf(state) && toggle && (node.properties?.[toggle[0]] ?? state[toggle[1]]) === false) return null;
+    throw new Error(`${label} uses a queue-driven image. Select the intended queue file in Import from canvas`);
+  }
+  const index = Number(match[1]) - 1;
+  const entry = state.reference_slots?.[index];
+  if (!entry || !conveyorRefEnabled(node, state, index)) return null;
+  const source = conveyorImage(entry);
+  if (!source) throw new Error(`${label} Ref ${index + 1} has no readable staged image`);
+  return { ...source, label: `${label} · Ref ${index + 1}`, selected: true };
+}
+
 export function canvasImageSources(app) {
   const graph = app.rootGraphOrUndefined || app.graph;
   const selected = selectedNodes(app);
@@ -38,15 +109,20 @@ export function canvasImageSources(app) {
       const label = `${prefix}${node.title || type} #${node.id}`;
       const outputKey = prefix && graph.id ? `${graph.id}:${node.id}` : node.id;
       const images = IMAGE_OUTPUTS.has(type) ? app.nodeOutputs?.[outputKey]?.images ?? node.images : null;
-      const sources = IMAGE_LOADERS.has(type)
-        ? [loaderImage(node, type)]
-        : (Array.isArray(images) ? images.map(image => imageLocation(image?.filename, image?.type ?? "output", image?.subfolder)) : []);
+      const nodeSelected = selected.has(node);
+      let sources = [];
+      if (CONVEYOR_NODES.has(type)) sources = conveyorCanvasSources(node, label, nodeSelected);
+      else if (IMAGE_LOADERS.has(type)) sources = [loaderImage(node, type)];
+      else if (Array.isArray(images)) {
+        sources = images.map(image => imageLocation(image?.filename, image?.type ?? "output", image?.subfolder));
+      }
       for (const source of sources) {
         if (!source) continue;
-        const key = JSON.stringify(source);
-        const fromSelectedNode = selected.has(node);
-        if (!candidates.has(key) || fromSelectedNode) {
-          candidates.set(key, { ...source, label, selected: fromSelectedNode });
+        const { filename, subfolder, type: folder } = source;
+        const key = JSON.stringify([folder, subfolder, filename]);
+        const fromSelectedNode = source.selected ?? nodeSelected;
+        if (!candidates.has(key) || (fromSelectedNode && !candidates.get(key).selected)) {
+          candidates.set(key, { ...source, label: source.label ?? label, selected: fromSelectedNode });
         }
       }
       visit(node.subgraph, `${label} / `);
@@ -92,6 +168,7 @@ export function conditioningImageSources(app) {
     if (!node) throw new Error("its source node is unavailable");
     const type = node.comfyClass || node.type;
     const label = `${node.title || type} #${node.id}`;
+    if (CONVEYOR_NODES.has(type)) return conveyorConditioningSource(node, link.origin_slot, label);
     if (IMAGE_LOADERS.has(type) && Number(link.origin_slot) === 0) {
       const source = loaderImage(node, type);
       if (source) return { ...source, label, selected: true };
