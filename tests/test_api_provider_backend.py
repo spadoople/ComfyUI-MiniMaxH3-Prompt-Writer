@@ -533,6 +533,18 @@ class ApiProviderBackendTests(unittest.TestCase):
                     if profile == "lm_studio":
                         self.assertNotIn("reasoning_effort", payload)
 
+    def test_manual_budget_reaches_compatible_api_providers(self):
+        for preset, field in (("openai", "max_completion_tokens"), ("custom", "max_tokens"), ("gemini", None)):
+            with self.subTest(preset=preset):
+                handler = _ApiChatHandler(self.backend, self._connection(preset=preset), "plain-model", limit_output=True)
+                handler(messages=[], temperature=1.0, top_p=0.95, top_k=64, max_tokens=4096, seed=None, thinking=False)
+                payload = _FakeApiHandler.requests[-1][3]
+                if field is None:
+                    self.assertNotIn("max_tokens", payload)
+                    self.assertNotIn("max_completion_tokens", payload)
+                else:
+                    self.assertEqual(payload[field], 4096)
+
     def test_openai_adapter_uses_provider_budget_and_store_false(self):
         connection = self._connection(preset="openai")
         handler = _ApiChatHandler(self.backend, connection, "plain-model")
@@ -660,6 +672,16 @@ class ApiProviderBackendTests(unittest.TestCase):
         self.assertEqual(plan["kv_cache"], "provider")
         self.assertEqual(plan["context_profile"], "provider")
         self.assertIsNone(plan["max_output_tokens"])
+        manual_budget_plan = self.backend.preflight(
+            model,
+            assembled,
+            context_profile="auto",
+            kv_cache="auto",
+            thinking=False,
+            generation_budget=4_096,
+        )
+        self.assertEqual(manual_budget_plan["max_output_tokens"], 4_096)
+        self.assertTrue(manual_budget_plan["generation_budget_manual"])
         music_plan = self.backend.preflight(
             model,
             {**assembled, "input": {"mode": "Music3"}},

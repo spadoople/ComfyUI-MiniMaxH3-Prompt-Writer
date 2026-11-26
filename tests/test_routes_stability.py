@@ -658,6 +658,11 @@ class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
             routes.clear_media(_Request(query={"session_id": self.session_id, "mode": "Reference"})),
             routes.resample_media(_Request(match_info={"asset_id": "asset"}, body={"session_id": self.session_id})),
             routes.upload_media(_Request()),
+            routes.import_comfy_input_media(_Request(body={
+                "session_id": self.session_id,
+                "mode": "Reference",
+                "filenames": ["image.png"],
+            })),
             routes.reorder_media(_Request(body={
                 "session_id": self.session_id,
                 "mode": "Reference",
@@ -667,6 +672,57 @@ class RouteStabilityTests(unittest.IsolatedAsyncioTestCase):
         for response in await __import__("asyncio").gather(*requests):
             self.assertEqual(response.status, 409)
             self.assertEqual(self.payload(response)["error"]["code"], "GENERATION_BUSY")
+
+    def test_comfy_input_file_stays_under_the_configured_input_directory_and_requires_an_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_root = Path(directory) / "input"
+            input_root.mkdir()
+            image = input_root / "references" / "frame.png"
+            image.parent.mkdir()
+            image.write_bytes(b"image")
+            audio = input_root / "sound.wav"
+            audio.write_bytes(b"audio")
+            outside = Path(directory) / "outside.png"
+            outside.write_bytes(b"outside")
+            with patch.object(routes.folder_paths, "get_input_directory", return_value=str(input_root)):
+                self.assertEqual(routes._comfy_input_file("references/frame.png"), image.resolve())
+                with self.assertRaises(routes.MediaError) as traversal:
+                    routes._comfy_input_file("../outside.png")
+                with self.assertRaises(routes.MediaError) as non_image:
+                    routes._comfy_input_file("sound.wav")
+        self.assertEqual(traversal.exception.code, "INVALID_INPUT_FILE")
+        self.assertEqual(non_image.exception.code, "UNSUPPORTED_MEDIA")
+
+    async def test_workflow_reference_import_copies_input_images_and_invalidates_only_reference_cache(self):
+        imported = {"id": "workflow-image", "mode": "Reference", "type": "image"}
+        reference_key = (self.session_id, "Reference")
+        text_key = (self.session_id, "T2VA")
+        routes.GENERATION_CACHE.update({reference_key: {"prompt": "reference"}, text_key: {"prompt": "text"}})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_root = root / "input"
+            input_root.mkdir()
+            source = input_root / "frame.png"
+            source.write_bytes(b"workflow image")
+            cache_root = root / "cache"
+            with (
+                patch.object(routes.folder_paths, "get_input_directory", return_value=str(input_root)),
+                patch.object(routes, "CACHE_ROOT", cache_root),
+                patch.object(routes.STORE, "prepare_add", return_value={"type": "image"}) as prepare_add,
+                patch.object(routes.STORE, "commit_add", return_value=imported),
+            ):
+                response = await routes.import_comfy_input_media(_Request(body={
+                    "session_id": self.session_id,
+                    "mode": "Reference",
+                    "filenames": ["frame.png"],
+                }))
+                stored_bytes = prepare_add.call_args.args[4].read_bytes()
+        self.assertEqual(response.status, 201)
+        self.assertEqual(self.payload(response), {"session_id": self.session_id, "assets": [imported]})
+        self.assertTrue(prepare_add.called)
+        self.assertEqual(stored_bytes, b"workflow image")
+        self.assertNotIn(reference_key, routes.GENERATION_CACHE)
+        self.assertIn(text_key, routes.GENERATION_CACHE)
 
     async def test_read_only_media_listing_remains_available_while_busy(self):
         routes.STATE["active_request_id"] = "request"

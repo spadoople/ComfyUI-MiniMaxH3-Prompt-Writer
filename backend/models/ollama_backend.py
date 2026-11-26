@@ -11,7 +11,13 @@ import threading
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from ..context import CONTEXT_PROFILES, ContextPlanError, estimate_text_tokens, plan_context
+from ..context import (
+    CHAT_TEMPLATE_OVERHEAD_TOKENS,
+    CONTEXT_SAFETY_TOKENS,
+    ContextPlanError,
+    estimate_text_tokens,
+    plan_context,
+)
 from ..h3_pipeline import run_h3_pipeline, validate_media_capabilities
 from .contract import ModelError
 
@@ -363,7 +369,8 @@ class OllamaBackend:
             if not isinstance(capabilities, list):
                 capabilities = entry.get("capabilities") if isinstance(entry.get("capabilities"), list) else []
             capability_set = {str(value).lower() for value in capabilities}
-            compatible = "completion" in capability_set and "vision" in capability_set
+            can_generate = "completion" in capability_set
+            has_vision = can_generate and "vision" in capability_set
             detail = details.get("details") if isinstance(details.get("details"), dict) else {}
             models.append({
                 "id": _ollama_model_id(endpoint, name),
@@ -373,9 +380,9 @@ class OllamaBackend:
                 "role": "ollama-compatible",
                 "remote_model": name,
                 "endpoint": endpoint,
-                "runtime_ready": compatible,
-                "missing_dependencies": [] if compatible else ["vision-capable Ollama model"],
-                "capabilities": {"images": compatible, "video_frames": compatible, "audio": False},
+                "runtime_ready": can_generate,
+                "missing_dependencies": [] if can_generate else ["Ollama model with text generation"],
+                "capabilities": {"images": has_vision, "video_frames": has_vision, "audio": False},
                 "thinking": "thinking" in capability_set,
                 "thinking_detected": "thinking" in capability_set,
                 "recommended_context": "low",
@@ -387,7 +394,7 @@ class OllamaBackend:
                 "size": entry.get("size"),
                 "digest": digest,
                 "available": True,
-                "tested_for_h3": name in TESTED_OLLAMA_TAGS,
+                "tested_for_h3": has_vision and name in TESTED_OLLAMA_TAGS,
                 "source_label": "Ollama · installed locally" if local_endpoint else f"Ollama · {endpoint}",
             })
         compatible_models = [model for model in models if model["runtime_ready"]]
@@ -415,7 +422,12 @@ class OllamaBackend:
         if model is None:
             raise ModelError("OLLAMA_MODEL_NOT_FOUND", "The selected Ollama model is not installed.", {"model": model_name})
         if not model["runtime_ready"]:
-            raise ModelError("OLLAMA_MODEL_INCOMPATIBLE", "The selected Ollama model does not report image understanding support.", {"model": model_name})
+            reason = (model.get("inspection_error") or {}).get("message")
+            raise ModelError(
+                "OLLAMA_MODEL_INCOMPATIBLE",
+                reason or "The selected Ollama model does not report text generation support.",
+                {"model": model_name},
+            )
         return model
 
     def preflight(
@@ -433,52 +445,32 @@ class OllamaBackend:
             raise ModelError("OLLAMA_KV_MANAGED", "KV cache is managed by Ollama. Set it to Auto.")
         if thinking and not model_info.get("thinking"):
             raise ModelError("OLLAMA_THINKING_UNAVAILABLE", "This Ollama model does not report thinking support.")
+        limit = int(model_info.get("model_context_limit") or 0)
+        use_native_context = (context_profile or "auto").strip().lower() == "auto" and limit > 0
         try:
             runtime_plan = plan_context(
                 assembled,
                 model_info,
                 requested_output_tokens=generation_budget,
-                requested_context=context_profile,
-                requested_context_tokens=context_tokens,
+                requested_context="custom" if use_native_context else context_profile,
                 requested_kv_cache="auto",
                 thinking=thinking,
+                requested_context_tokens=limit if use_native_context else context_tokens,
             )
         except ContextPlanError as error:
             raise ModelError(error.code, error.message, error.details) from error
-        limit = int(model_info.get("model_context_limit") or 0)
         if limit and runtime_plan["context_tokens"] > limit:
-            requested = (context_profile or "auto").lower()
-            if requested == "auto" and model_info.get("auto_context_ladder") is True:
-                raise ModelError(
-                    "OLLAMA_MODEL_CONTEXT_LIMIT",
-                    "This request needs more context than the selected Ollama model supports.",
-                    {
-                        "required_context_tokens": runtime_plan["context_tokens"],
-                        "model_context_limit": limit,
-                        "suggestion": "Remove references, shorten the creative brief, or select a model with a larger context window.",
-                    },
-                )
-            if requested != "auto":
-                raise ModelError(
-                    "OLLAMA_MODEL_CONTEXT_LIMIT",
-                    "The selected Context exceeds this Ollama model's declared limit.",
-                    {"context_tokens": runtime_plan["context_tokens"], "model_context_limit": limit},
-                )
-            fitting = [name for name, tokens in CONTEXT_PROFILES.items() if tokens <= limit]
-            if not fitting:
-                raise ModelError("OLLAMA_MODEL_CONTEXT_LIMIT", "This Ollama model has too little declared context for H3 Prompt Writer.", {"model_context_limit": limit})
-            try:
-                runtime_plan = plan_context(
-                    assembled,
-                    model_info,
-                    requested_output_tokens=generation_budget,
-                    requested_context=fitting[-1],
-                    requested_kv_cache="auto",
-                    thinking=thinking,
-                )
-            except ContextPlanError as error:
-                raise ModelError(error.code, error.message, error.details) from error
-            runtime_plan["requested_context_profile"] = "auto"
+            raise ModelError(
+                "OLLAMA_MODEL_CONTEXT_LIMIT",
+                "The selected Context exceeds the Ollama model's declared limit.",
+                {"context_tokens": runtime_plan["context_tokens"], "model_context_limit": limit},
+            )
+        if use_native_context:
+            runtime_plan["use_native_context"] = True
+            if generation_budget is None:
+                remaining_tokens = limit - runtime_plan["estimated_input_tokens"]
+                runtime_plan["max_output_tokens"] = remaining_tokens - CONTEXT_SAFETY_TOKENS
+                runtime_plan["reserved_output_tokens"] = remaining_tokens
         runtime_plan["kv_cache"] = "ollama"
         runtime_plan["requested_kv_cache"] = "auto"
         return runtime_plan
@@ -497,10 +489,24 @@ class OllamaBackend:
         seed: int | None,
         thinking: bool,
     ) -> dict[str, Any]:
+        ollama_messages = _ollama_messages(messages)
+        use_native_context = runtime_plan.get("use_native_context") is True
+        if use_native_context:
+            input_tokens = estimate_text_tokens("\n\n".join(message["content"] for message in ollama_messages))
+            if any(message.get("images") for message in ollama_messages):
+                input_tokens += runtime_plan["estimated_visual_tokens"]
+            remaining = runtime_plan["context_tokens"] - input_tokens - CHAT_TEMPLATE_OVERHEAD_TOKENS - CONTEXT_SAFETY_TOKENS
+            if remaining <= 0:
+                raise ModelError(
+                    "CONTEXT_BUDGET_EXCEEDED",
+                    "This request leaves no Ollama context for output. Shorten the brief or choose a model with a larger context window.",
+                )
+            max_tokens = min(max_tokens, remaining)
         payload: dict[str, Any] = {
             "model": model_name,
-            "messages": _ollama_messages(messages),
+            "messages": ollama_messages,
             "stream": True,
+            **({"truncate": False, "shift": False} if use_native_context else {}),
             "think": thinking,
             "keep_alive": -1,
             "options": {

@@ -15,6 +15,8 @@ Ollama is the recommended local provider. It keeps the prompt-model runtime outs
 
 Prompt Writer only checks the selected Ollama service and its installed models. It does not start `ollama serve`, call `/api/pull`, or download models.
 
+The picker lists installed models and enables those that report text generation support. Text-only models work for prompts without visual references. Choose a vision model for images or video. Embedding-only models are listed as unavailable for prompting.
+
 ## Ollama on another computer
 
 The default host is `http://127.0.0.1:11434`. To use Ollama on another computer, open the collapsed **Use Ollama on another computer** control in Ollama Settings and enter that server's root URL, such as `http://192.168.1.25:11434`.
@@ -45,9 +47,9 @@ You can try other Ollama vision models when Ollama reports the required image ca
 
 ## Context and Thinking
 
-Leave **Context (tokens)** empty for Auto. Writer estimates the assembled request and selects 8K, 16K, or 24K. To use less memory or fit a larger Sequence, enter an exact token count, including values above 24K. Writer sends it as `num_ctx` and checks that the input and reply fit within it and that it respects the model's reported limit. Ollama controls KV cache and GPU/CPU placement.
+Leave **Context (tokens)** empty to use the selected model’s reported maximum. If the model does not report a maximum, Writer chooses the smallest suitable automatic tier. Enter an exact token count to control memory use, and choose a Generation budget to set a reply limit. With the model's maximum context and no manual budget, Writer gives the remaining space after the request to generation. Ollama manages the KV cache and CPU/GPU placement.
 
-The **Thinking** switch is available only when the selected Ollama model reports thinking support. When enabled, Auto reserves the larger reasoning and final-output budget before choosing context.
+The **Thinking** switch is available when the selected Ollama model reports thinking support. Reasoning and the final response share the output budget.
 
 ## Model lifecycle
 

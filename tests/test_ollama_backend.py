@@ -63,6 +63,7 @@ class _FakeOllamaHandler(BaseHTTPRequestHandler):
                         "digest": "text-digest",
                         "size": 456,
                     },
+                    {"name": "embed:test", "digest": "embed-digest", "size": 321},
                     {"name": "cloud:model", "digest": "", "size": 0},
                 ],
             })
@@ -82,6 +83,8 @@ class _FakeOllamaHandler(BaseHTTPRequestHandler):
                     "model_info": {"gemma4.context_length": 12288},
                     "details": {"parameter_size": "12B", "quantization_level": "Q4_K_M"},
                 })
+            elif payload.get("model") == "embed:test":
+                self._json({"capabilities": ["embedding"]})
             else:
                 self._json({"capabilities": ["completion"], "model_info": {"test.context_length": 8192}})
         elif self.path == "/api/generate":
@@ -294,8 +297,8 @@ class OllamaBackendTests(unittest.TestCase):
 
         self.assertEqual(detected["state"], "ready")
         self.assertEqual(detected["model_tiers"], OLLAMA_MODEL_TIERS)
-        self.assertEqual([model["remote_model"] for model in detected["models"]], ["gemma4:test", "text:test"])
-        self.assertEqual([model["remote_model"] for model in detected["compatible_models"]], ["gemma4:test"])
+        self.assertEqual([model["remote_model"] for model in detected["models"]], ["gemma4:test", "text:test", "embed:test"])
+        self.assertEqual([model["remote_model"] for model in detected["compatible_models"]], ["gemma4:test", "text:test"])
         model = detected["compatible_models"][0]
         self.assertEqual(model["model_context_limit"], 12288)
         self.assertEqual(model["recommended_context"], "low")
@@ -303,6 +306,16 @@ class OllamaBackendTests(unittest.TestCase):
         self.assertTrue(model["thinking_detected"])
         self.assertFalse(model["tested_for_h3"])
         self.assertFalse(model["capabilities"]["audio"])
+
+    def test_text_model_can_prompt_without_claiming_vision_support(self):
+        model = self.backend.probe_model("text:test")
+        self.assertTrue(model["runtime_ready"])
+        self.assertFalse(model["capabilities"]["images"])
+        self.assertFalse(model["capabilities"]["video_frames"])
+
+        with self.assertRaises(ModelError) as incompatible:
+            self.backend.probe_model("embed:test")
+        self.assertEqual(incompatible.exception.code, "OLLAMA_MODEL_INCOMPATIBLE")
 
     def test_custom_endpoint_scopes_model_ids_metadata_cache_and_inference(self):
         local = self.backend.detect(self.url)
@@ -395,15 +408,25 @@ class OllamaBackendTests(unittest.TestCase):
                                    kv_cache="auto", thinking=False, context_tokens=65537)
         self.assertEqual(oversized.exception.code, "OLLAMA_MODEL_CONTEXT_LIMIT")
 
-    def test_automatic_ladder_and_fixed_profile_obey_model_limit(self):
+    def test_auto_context_uses_model_limit_and_sends_remaining_space_for_output(self):
+        assembled = self._assembled()
         plan = self.backend.preflight(
-            self._model(), self._assembled(),
+            self._model(), assembled,
             context_profile="auto", kv_cache="auto", thinking=False,
         )
 
-        self.assertEqual(plan["context_profile"], "low")
-        self.assertEqual(plan["context_tokens"], 8192)
+        self.assertEqual(plan["context_tokens"], 12288)
+        self.assertGreater(plan["max_output_tokens"], 8192)
         self.assertEqual(plan["kv_cache"], "ollama")
+        self.backend._chat_completion(
+            "gemma4:test", plan, messages=assembled["messages"],
+            temperature=1.0, top_p=0.95, top_k=64, max_tokens=plan["max_output_tokens"], seed=None, thinking=False,
+        )
+        payload = next(payload for _, path, payload in _FakeOllamaHandler.requests if path == "/api/chat")
+        self.assertEqual(payload["options"]["num_ctx"], 12288)
+        self.assertEqual(payload["options"]["num_predict"], plan["max_output_tokens"])
+        self.assertFalse(payload["truncate"])
+        self.assertFalse(payload["shift"])
         with self.assertRaises(ModelError) as manual:
             self.backend.preflight(
                 self._model(), self._assembled(),
@@ -413,7 +436,7 @@ class OllamaBackendTests(unittest.TestCase):
 
     def test_auto_context_rejects_a_request_larger_than_the_model_limit(self):
         assembled = self._assembled()
-        assembled["messages"][1]["content"] = "x" * 20_000
+        assembled["messages"][1]["content"] = "x" * 40_000
 
         with self.assertRaises(ModelError) as raised:
             self.backend.preflight(
@@ -421,9 +444,8 @@ class OllamaBackendTests(unittest.TestCase):
                 context_profile="auto", kv_cache="auto", thinking=False,
             )
 
-        self.assertEqual(raised.exception.code, "OLLAMA_MODEL_CONTEXT_LIMIT")
-        self.assertEqual(raised.exception.details["required_context_tokens"], 16384)
-        self.assertEqual(raised.exception.details["model_context_limit"], 12288)
+        self.assertEqual(raised.exception.code, "CONTEXT_BUDGET_EXCEEDED")
+        self.assertEqual(raised.exception.details["context_tokens"], 12288)
 
     def test_rejects_provider_managed_kv_and_unreported_thinking(self):
         model = self._model()

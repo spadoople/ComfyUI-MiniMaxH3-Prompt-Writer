@@ -18,6 +18,7 @@ import "./editor_geometry.mjs";
 import "./editor_interactions.mjs";
 import "./media_tools.mjs";
 import "./workflow_media.mjs";
+import "./canvas_image_picker.mjs";
 import "./floating_media.mjs";
 
 const source = await readFile(new URL("../web/compat.js", import.meta.url), "utf8");
@@ -799,15 +800,16 @@ test("custom contact sheet counts accept only whole values from 2 through 24", (
   }
 });
 
-test("long video drafts remain intact while Music keeps 2000", () => {
+test("long drafts and generated prompts remain intact", () => {
   const storage = memoryStorage();
   saveModeDrafts(storage, {
-    T2VA: { brief: "v".repeat(40000), prompt: "Video prompt" },
+    T2VA: { brief: "v".repeat(40000), prompt: "p".repeat(25000) },
     Music3: { brief: "m".repeat(8000), prompt: "Music prompt", lyrics: "Lyrics" },
   });
   const drafts = loadModeDrafts(storage);
   assert.equal(drafts.T2VA.brief.length, 40000);
-  assert.equal(drafts.Music3.brief.length, 2000);
+  assert.equal(drafts.T2VA.prompt.length, 25000);
+  assert.equal(drafts.Music3.brief.length, 8000);
 });
 
 test("draft dirty state covers every mode", () => {
@@ -1180,10 +1182,14 @@ test("Generate and Refine payloads are built from state rather than Settings DOM
     capabilities: { audio: false, images: true },
   };
   selectModelState(state, apiModel);
+  state.generationBudget = "4096";
   const apiPayload = buildGeneratePayload(state, { creativeBrief: "A quiet shot.", seed: 3407 });
   assert.deepEqual(apiPayload.api_provider, { connection_id: "connection-id", model_id: "provider/model" });
   assert.equal(apiPayload.external_server, null);
   assert.equal(apiPayload.ollama_model, null);
+  assert.equal(apiPayload.generation_budget, 4096);
+  assert.match(mainSource, /const budgetSupported = direct \|\| \["api", "ollama"\]\.includes\(studio\.settingsProvider\)/);
+  assert.equal(buildRefinePayload(state, { currentPrompt: "Current", instruction: "Shorter" }).generation_budget, 4096);
 
   selectModelState(state, { id: "direct.gguf", family: "gguf", capabilities: { audio: false } });
   state.contextProfile = "custom";
@@ -1282,7 +1288,7 @@ test("Settings separates providers, installed models, diagnostics, and verified 
   assert.match(mainSource, /Troubleshooting ↗/);
   assert.match(mainSource, /refreshGGUFRuntimeDiagnostics\(\)/);
   assert.match(markup, /h3ps-model-icon h3ps-provider-icon[^>]+data-provider-icon="direct"/);
-  assert.match(mainSource, /runtimeSettings\.hidden = !\["direct", "ollama"\]\.includes\(provider\)/);
+  assert.match(mainSource, /runtimeSettings\.hidden = !\["direct", "ollama", "api"\]\.includes\(provider\)/);
   assert.doesNotMatch(mainSource, /Context is sent explicitly with each request/);
   assert.match(mainSource, /studio\.selectedModel\?\.family === "gguf"/);
   assert.doesNotMatch(mainSource, /\/api\/pull/);
@@ -1521,6 +1527,16 @@ test("active requests block add, reorder, and mode switching", () => {
   assert.match(mainSource, /if \(!files\.length \|\| studio\.requestBusy\) return/);
   assert.match(mainSource, /studio\.requestBusy = busy;[\s\S]{0,120}syncModeAvailability\(\)/);
   assert.match(mainSource, /const unavailable = !isGenerationModeAvailable[\s\S]{0,180}control\.disabled = studio\.requestBusy \|\| unavailable/);
+});
+
+test("Reference mode can import its ordered LoadImage inputs from Reference Inference Desk", () => {
+  assert.match(mainSource, /data-import-workflow-references/);
+  assert.match(mainSource, /function workflowReferenceFilenames\(\)/);
+  assert.match(mainSource, /ReferenceVisionInference/);
+  assert.match(mainSource, /match\(\/\^image_\(\\d\+\)\$\/\)/);
+  assert.match(mainSource, /widgetValue\(source, "image"\)/);
+  assert.match(mainSource, /sort\(\(left, right\) => left\.slot - right\.slot\)/);
+  assert.match(mainSource, /importComfyInputMedia\(studio\.sessionId, "Reference", filenames\)/);
 });
 
 test("text-only Direct UI disables visual modes and explains the fallback", () => {

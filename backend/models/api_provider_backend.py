@@ -164,11 +164,12 @@ class ApiConnection:
 
 
 class _ApiChatHandler:
-    def __init__(self, backend: "ApiProviderBackend", connection: ApiConnection, model_id: str, sampling: dict[str, Any] | None = None) -> None:
+    def __init__(self, backend: "ApiProviderBackend", connection: ApiConnection, model_id: str, sampling: dict[str, Any] | None = None, *, limit_output: bool = False) -> None:
         self.backend = backend
         self.connection = connection
         self.model_id = model_id
         self.sampling = dict(sampling or {})
+        self.limit_output = limit_output
 
     def __call__(
         self,
@@ -182,7 +183,7 @@ class _ApiChatHandler:
         thinking: bool,
         **_unused: Any,
     ) -> dict[str, Any]:
-        del temperature, top_p, top_k, seed, max_tokens
+        del temperature, top_p, top_k, seed
         payload: dict[str, Any] = {
             "model": self.model_id,
             "messages": messages,
@@ -193,8 +194,10 @@ class _ApiChatHandler:
             payload["stream_options"] = {"include_usage": True}
         if preset == "openai":
             payload["store"] = False
-        # Output limits belong to the provider/runtime. In particular, the
-        # pipeline's non-thinking and repair budgets are not API request caps.
+        # Only an explicit budget becomes an API request cap. Gemini manages its own output.
+        if self.limit_output and max_tokens is not None and preset != "gemini":
+            field = "max_completion_tokens" if preset == "openai" else "max_tokens"
+            payload[field] = max_tokens
         # Never inherit the local pipeline's sampler defaults for API requests.
         # Values are validated against the selected provider/model in preflight.
         payload.update(self.sampling)
@@ -674,6 +677,7 @@ class ApiProviderBackend:
         context_profile: str | None,
         kv_cache: str | None,
         thinking: bool,
+        generation_budget: int | None = None,
         sampling: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         api_sampling = validate_sampling(sampling, model_info.get("sampling_parameters", []))
@@ -700,7 +704,13 @@ class ApiProviderBackend:
             estimated_input_tokens + THINKING_OUTPUT_TOKENS + CONTEXT_SAFETY_TOKENS,
         )
         standard_output_tokens = non_thinking_output_tokens(assembled)
-        desired_output = THINKING_OUTPUT_TOKENS if thinking else standard_output_tokens
+        if generation_budget is not None and (
+            not isinstance(generation_budget, int)
+            or isinstance(generation_budget, bool)
+            or generation_budget <= 0
+        ):
+            raise ModelError("INVALID_GENERATION_BUDGET", "Generation budget must be a positive integer number of tokens.")
+        desired_output = generation_budget or (THINKING_OUTPUT_TOKENS if thinking else standard_output_tokens)
         provider_max_output = model_info.get("max_output_tokens")
         if isinstance(provider_max_output, int) and provider_max_output > 0:
             desired_output = min(desired_output, provider_max_output)
@@ -716,6 +726,7 @@ class ApiProviderBackend:
                     "suggestion": "Choose a larger-context API model or remove references.",
                 },
             )
+        max_output_tokens = min(desired_output, available_output) if generation_budget is not None else None
         return {
             "requested_context_profile": "auto",
             "api_sampling": api_sampling,
@@ -727,9 +738,10 @@ class ApiProviderBackend:
             "estimated_text_tokens": estimated_text_tokens,
             "estimated_input_tokens": estimated_input_tokens,
             "visual_input_count": visual_input_count,
-            "max_output_tokens": None,
-            "reserved_output_tokens": CONTEXT_SAFETY_TOKENS,
-            "thinking_budget_reduced": False,
+            "max_output_tokens": max_output_tokens,
+            "reserved_output_tokens": (max_output_tokens or 0) + CONTEXT_SAFETY_TOKENS,
+            "generation_budget_manual": generation_budget is not None,
+            "thinking_budget_reduced": thinking and max_output_tokens is not None and max_output_tokens < THINKING_OUTPUT_TOKENS,
             "context_limit_known": known_context is not None,
         }
 
@@ -866,6 +878,7 @@ class ApiProviderBackend:
         unload_after: bool,
         context_profile: str | None = None,
         kv_cache: str | None = None,
+        generation_budget: int | None = None,
         runtime_plan: dict[str, Any] | None = None,
         on_phase: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
@@ -879,12 +892,16 @@ class ApiProviderBackend:
                 context_profile=context_profile,
                 kv_cache=kv_cache,
                 thinking=thinking,
+                generation_budget=generation_budget,
             )
             self.model_id = model_info["id"]
             try:
                 if on_phase:
                     on_phase("loading_model")
-                handler = _ApiChatHandler(self, connection, model_info["remote_model"], runtime_plan.get("api_sampling"))
+                handler = _ApiChatHandler(
+                    self, connection, model_info["remote_model"], runtime_plan.get("api_sampling"),
+                    limit_output=runtime_plan.get("generation_budget_manual", False),
+                )
 
                 def complete(**kwargs: Any) -> dict[str, Any]:
                     kwargs.pop("purpose", None)

@@ -13,6 +13,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from aiohttp import web
+import folder_paths
 from server import PromptServer
 
 from .assembly import AssemblyError, assemble_lyrics_request, assemble_refinement, assemble_request
@@ -20,7 +21,7 @@ from .catalog import discover_models_with_diagnostics, find_model, model_setup_c
 from .comfy_state import comfyui_runtime_snapshot
 from .devlog import DEVELOPER_MODE, LOG_PATH, PeakVRAMMonitor, gpu_memory_snapshot, write_event
 from .guides import MODE_GUIDES, guide_catalog, guide_for_mode
-from .media import CACHE_ROOT, MAX_FILE_BYTES, MODE_LIMITS, STORE, MediaError, parse_session_id
+from .media import CACHE_ROOT, MAX_FILE_BYTES, MODE_LIMITS, STORE, MediaError, media_type, parse_session_id
 from .media_editor import browser_source, commit_edit, prepare_edit, video_frame
 from .memory import assess_free_vram
 from .models.gguf_backend import BACKEND as GGUF_BACKEND
@@ -402,10 +403,10 @@ async def _prepare_generation_runtime(
         "kv_cache": body.get("kv_cache", "auto"),
         "thinking": body.get("thinking", False),
     }
-    if model["family"] in {"gguf", "ollama"}:
+    if model["family"] in {"gguf", "ollama", "api"}:
         runtime_options["generation_budget"] = body.get("generation_budget")
-        if body.get("context_tokens") is not None:
-            runtime_options["context_tokens"] = body["context_tokens"]
+    if model["family"] in {"gguf", "ollama"} and body.get("context_tokens") is not None:
+        runtime_options["context_tokens"] = body["context_tokens"]
     if model["family"] == "api":
         runtime_options["sampling"] = body.get("api_sampling")
     if model["family"] == "gguf":
@@ -1127,6 +1128,100 @@ async def upload_media(request: web.Request) -> web.Response:
     return web.json_response({"session_id": session_id, "assets": uploaded}, status=201)
 
 
+def _comfy_input_file(filename: str) -> Path:
+    """Resolve a LoadImage filename without allowing reads outside ComfyUI/input."""
+    if not isinstance(filename, str) or not filename.strip():
+        raise MediaError("INVALID_INPUT_FILE", "A ComfyUI input filename is required.")
+    input_root = Path(folder_paths.get_input_directory()).resolve()
+    candidate = (input_root / filename).resolve()
+    try:
+        candidate.relative_to(input_root)
+    except ValueError as error:
+        raise MediaError("INVALID_INPUT_FILE", "Workflow imports must stay inside ComfyUI's input directory.") from error
+    if not candidate.is_file():
+        raise MediaError("INPUT_FILE_NOT_FOUND", f"ComfyUI input file was not found: {filename}")
+    if candidate.stat().st_size > MAX_FILE_BYTES:
+        raise MediaError("MEDIA_TOO_LARGE", "A media file cannot exceed 1 GB.")
+    if media_type(candidate.name, mimetypes.guess_type(candidate.name)[0]) != "image":
+        raise MediaError("UNSUPPORTED_MEDIA", "Workflow-reference import accepts image files only.")
+    return candidate
+
+
+@routes.post(f"{ROUTE_PREFIX}/media/import-comfy-input")
+async def import_comfy_input_media(request: web.Request) -> web.Response:
+    """Copy existing LoadImage assets into the Writer's isolated session store."""
+    busy = _generation_busy_error()
+    if busy is not None:
+        return busy
+    body = await _json_body(request)
+    if body is None:
+        return _error("INVALID_REQUEST", "Expected a JSON object.", status=400)
+    try:
+        session_id = parse_session_id(body.get("session_id"))
+        mode = str(body.get("mode") or "")
+        filenames = body.get("filenames")
+        if mode != "Reference":
+            raise MediaError("INVALID_MODE", "Workflow-reference import is available in Reference mode only.")
+        if not isinstance(filenames, list) or not filenames or not all(isinstance(item, str) for item in filenames):
+            raise MediaError("INVALID_REQUEST", "Provide one or more ComfyUI input filenames.")
+        if len(filenames) > 9:
+            raise MediaError("MEDIA_LIMIT_REACHED", "Reference mode accepts at most 9 image files.")
+        sources = [_comfy_input_file(filename) for filename in filenames]
+    except ValueError:
+        return _error("INVALID_SESSION", "The media session ID is invalid.", status=400)
+    except MediaError as error:
+        return _media_error(error, status=400)
+
+    if not _claim_media_mutation():
+        return _error("GENERATION_BUSY", "Media cannot be changed while H3 Prompt Writer is generating or refining.", status=409)
+    uploaded: list[dict[str, Any]] = []
+    uploaded_ids: list[str] = []
+    asset_dir: Path | None = None
+    try:
+        for source in sources:
+            asset_dir = CACHE_ROOT / session_id / str(uuid4())
+            asset_dir.mkdir(parents=True, exist_ok=False)
+            stored_path = asset_dir / f"original{source.suffix.lower()}"
+            _copied, cancellation = await _run_thread_worker(shutil.copyfile, source, stored_path)
+            _propagate_worker_cancellation(cancellation)
+            prepared, cancellation = await _run_thread_worker(
+                STORE.prepare_add,
+                session_id,
+                mode,
+                source.name,
+                mimetypes.guess_type(source.name)[0],
+                stored_path,
+            )
+            _propagate_worker_cancellation(cancellation)
+            asset = STORE.commit_add(session_id, mode, prepared)
+            uploaded.append(asset)
+            uploaded_ids.append(asset["id"])
+            asset_dir = None
+    except MediaError as error:
+        if asset_dir is not None:
+            shutil.rmtree(asset_dir, ignore_errors=True)
+        for asset_id in uploaded_ids:
+            try:
+                STORE.remove(session_id, asset_id)
+            except MediaError:
+                pass
+        return _media_error(error, status=400)
+    except BaseException:
+        if asset_dir is not None:
+            shutil.rmtree(asset_dir, ignore_errors=True)
+        for asset_id in uploaded_ids:
+            try:
+                STORE.remove(session_id, asset_id)
+            except MediaError:
+                pass
+        raise
+    finally:
+        _release_media_mutation()
+
+    _invalidate_generation_cache(session_id, mode)
+    return web.json_response({"session_id": session_id, "assets": uploaded}, status=201)
+
+
 @routes.get(f"{ROUTE_PREFIX}/media")
 async def list_media(request: web.Request) -> web.Response:
     try:
@@ -1176,8 +1271,9 @@ async def media_content(request: web.Request) -> web.StreamResponse:
             if revision != int(current.get("content_revision", current.get("sample_index", 0))):
                 raise web.HTTPConflict(text="Media changed during transfer. Drop the current version again.")
             headers["Cache-Control"] = "no-store"
-            # FileResponse's private MIME table can omit formats known to Python's registry.
-            headers["Content-Type"] = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            # Windows can register MP3 as audio/mp3; workflow loaders expect the standard MIME type.
+            content_type = "audio/mpeg" if path.suffix.lower() == ".mp3" else mimetypes.guess_type(path.name)[0]
+            headers["Content-Type"] = content_type or "application/octet-stream"
             filename = Path(asset.get("filename") or path.name).stem + path.suffix
             headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(filename, safe='')}"
         elif kind == "frame":

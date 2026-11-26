@@ -7,7 +7,9 @@ import { mediaVisualDescriptor } from "./media_visual.js";
 import { createSequenceWorkspace } from "./sequence_workspace.js";
 import { generateSequence, cancelSequence } from "./api/sequence.js";
 import { app } from "/scripts/app.js";
-import { selectProjector, cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
+import { api } from "/scripts/api.js";
+import { canvasImageSources, createCanvasImagePicker, readCanvasImageFiles } from "./canvas_image_picker.js";
+import { selectProjector, cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, importComfyInputMedia, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
 import { comfyVramIsAlreadyEmpty, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
 import { generateModelSummaryMarkup, settingsMarkup } from "./settings.js";
 import {
@@ -525,6 +527,9 @@ function renderMedia(mode) {
         <button type="button" data-media-filter="image" class="${filter === "image" ? "is-active" : ""}">${icon("image", 13)} Images <b>${counts.image || 0}/9</b></button>
         <button type="button" data-media-filter="video" class="${filter === "video" ? "is-active" : ""}">${icon("video", 13)} Video <b>${counts.video || 0}/3</b></button>
         <button type="button" data-media-filter="audio" class="${filter === "audio" ? "is-active" : ""}">${icon("audio", 13)} Audio <b>${counts.audio || 0}/3</b></button>
+        ${HOST_CAPABILITIES.workflowMedia && studio.mode === "Reference" ? `
+          <button type="button" data-import-canvas-images ${studio.requestBusy ? "disabled" : ""}>${icon("image", 13)} Import from canvas</button>
+          <button type="button" data-import-workflow-references ${studio.requestBusy ? "disabled" : ""}>Import workflow images</button>` : ""}
       </div>` : "";
     const addLabel = !isReference || filter === "image" ? "Add image" : filter === "video" ? "Add video" : filter === "audio" ? "Add audio" : "Add media";
     const canAdd = isReference || assets.length < data.limit;
@@ -664,6 +669,10 @@ function bindMediaActions(mode) {
   studio.root.querySelectorAll("[data-add-media]").forEach((button) => {
     button.addEventListener("click", () => chooseMedia(mode));
   });
+  studio.root.querySelectorAll("[data-import-workflow-references]").forEach((button) => {
+    button.addEventListener("click", () => importWorkflowReferences());
+  });
+  media.querySelector("[data-import-canvas-images]")?.addEventListener("click", openCanvasImagePicker);
   studio.root.querySelectorAll("[data-asset-id]").forEach((card) => {
     card.addEventListener("dragstart", (event) => {
       if (studio.requestBusy) {
@@ -782,6 +791,80 @@ async function uploadFiles(mode, files, replaceAssetId = null) {
     renderMedia(studio.mode);
     showToast(error.code || "Upload failed", error.message, error.details);
   }
+}
+
+function widgetValue(node, name) {
+  const widget = node?.widgets?.find((item) => item.name === name);
+  return typeof widget?.value === "string" ? widget.value : null;
+}
+
+function workflowReferenceFilenames() {
+  const graph = app.graph;
+  const nodes = graph?._nodes || [];
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const candidates = nodes.map((target) => {
+    const type = target.comfyClass || target.type || "";
+    if (!String(type).includes("ReferenceVisionInference")) return [];
+    return (target.inputs || []).flatMap((input) => {
+      const slot = String(input?.name || "").match(/^image_(\d+)$/);
+      const link = input?.link == null ? null : graph.links?.[input.link];
+      const source = link ? nodeById.get(link.origin_id) : null;
+      const filename = widgetValue(source, "image");
+      return slot && filename ? [{ slot: Number(slot[1]), filename }] : [];
+    }).sort((left, right) => left.slot - right.slot);
+  }).filter((references) => references.length);
+  if (candidates.length !== 1) {
+    throw new Error(candidates.length
+      ? "Found multiple Reference Inference Desk nodes. Keep one connected reference set in this workflow before importing."
+      : "No directly connected LoadImage references were found on a Reference Inference Desk node.");
+  }
+  return candidates[0].map((reference) => reference.filename);
+}
+
+async function importWorkflowReferences() {
+  if (studio.requestBusy || studio.mode !== "Reference") return;
+  try {
+    const filenames = workflowReferenceFilenames();
+    showToast("Importing workflow images", `Copying ${filenames.length} ordered reference image${filenames.length === 1 ? "" : "s"}…`);
+    const result = await importComfyInputMedia(studio.sessionId, "Reference", filenames);
+    studio.sessionId = result.session_id;
+    acceptMediaAssets([...studio.assets, ...result.assets]);
+    renderMedia("Reference");
+    hideToast();
+  } catch (error) {
+    renderMedia("Reference");
+    showToast(error.code || "Workflow import failed", error.message);
+  }
+}
+
+function canvasImageCapacity() {
+  const assets = studio.assets.filter(asset => asset.mode === "Reference");
+  const pictureCount = assets.filter(asset => asset.type === "image").length;
+  return { pictureCount, remaining: Math.max(0, Math.min(9 - pictureCount, 12 - assets.length)) };
+}
+
+function openCanvasImagePicker() {
+  if (studio.requestBusy || studio.mode !== "Reference") return;
+  studio.canvasImagePicker ??= createCanvasImagePicker({
+    root: studio.root,
+    viewUrl: route => api.apiURL(route),
+    getCapacity: canvasImageCapacity,
+    async onImport(sources) {
+      const revision = studio.canvasPickerWorkflowRevision;
+      if (workflowRevision !== revision) throw new Error("The workflow changed. Close the picker and open it again.");
+      const files = await readCanvasImageFiles(sources, route => api.fetchApi(route));
+      if (workflowRevision !== revision) throw new Error("The workflow changed. Close the picker and open it again.");
+      if (studio.requestBusy || studio.mode !== "Reference") throw new Error("Switch to Reference and wait for any Writer request to finish.");
+      const result = await uploadMedia(studio.sessionId, "Reference", files);
+      studio.sessionId = result.session_id;
+      studio.assets = [...studio.assets, ...result.assets];
+      studio.mediaFilter = "image";
+      renderMedia("Reference");
+      requestAnimationFrame(() => studio.root.querySelector("[data-import-canvas-images]")?.focus());
+    },
+  });
+  studio.canvasPickerWorkflowRevision = workflowRevision;
+  studio.canvasImagePicker.open(canvasImageSources(app));
 }
 
 function showToast(title, message, details = null, action = null, options = {}) {
@@ -1002,8 +1085,11 @@ function updateBriefLayout() {
   const compactHeight = window.innerHeight <= 800;
   const largeCanvas = window.innerWidth >= 3000 && window.innerHeight >= 1600;
   const minimumHeight = compactHeight ? 80 : largeCanvas ? 125 : 105;
+  const briefLimit = studio.mode === "Music3" && studio.selectedModel?.family !== "ollama" ? 2000 : null;
+  if (briefLimit === null) brief.removeAttribute("maxlength");
+  else brief.maxLength = briefLimit;
   const counter = brief.closest(".h3ps-brief").querySelector(".h3ps-char-count");
-  counter.textContent = `${brief.value.length.toLocaleString()}${studio.mode === "Music3" ? " / 2,000" : " characters"}`;
+  counter.textContent = `${brief.value.length.toLocaleString()}${briefLimit === null ? " characters" : " / 2,000"}`;
   fitTextarea(brief, minimumHeight, 2);
   brief.style.overflowY = "hidden";
 }
@@ -1794,7 +1880,10 @@ function ollamaModelForSettings() {
   if (studio.selectedModel?.family === "ollama" && studio.selectedModel.endpoint === studio.ollamaHost) {
     return models.find((model) => model.id === studio.selectedModel.id) || studio.selectedModel;
   }
-  return models.find((model) => model.remote_model === studio.ollamaModelName) || models[0] || null;
+  return models.find((model) => model.remote_model === studio.ollamaModelName)
+    || models.find((model) => model.capabilities?.images)
+    || models[0]
+    || null;
 }
 
 function ollamaHostControlMarkup(hostValue = studio.ollamaHost) {
@@ -1872,26 +1961,33 @@ function renderOllamaProviderControl(hostValue) {
     </div>${hostControl}`;
   }
   const models = ollamaModels();
+  const selected = ollamaModelForSettings();
+  const installedModels = Array.isArray(status.models) ? status.models : models;
+  const modelOptions = installedModels.map((model) => {
+    const availability = model.runtime_ready ? (model.capabilities?.images ? "Vision" : "Text only") : "Unavailable for prompting";
+    return `<option value="${escapeHtml(model.remote_model)}" ${model.runtime_ready ? "" : "disabled"} ${model.remote_model === selected?.remote_model ? "selected" : ""}>${escapeHtml(model.name)}${model.parameter_size ? ` · ${escapeHtml(model.parameter_size)}` : ""}${model.quantization_level ? ` · ${escapeHtml(model.quantization_level)}` : ""} · ${availability}</option>`;
+  }).join("");
+  const modelPicker = `<label class="h3ps-ollama-model-select"><select data-ollama-model aria-label="Installed Ollama models" ${models.length ? "" : "disabled"}>${modelOptions}</select></label>`;
   if (!models.length) {
     return `${header}${ollamaJourneyMarkup("model")}<div class="h3ps-ollama-state h3ps-ollama-model-state">
       <span class="h3ps-ollama-state-copy"><strong>Add a compatible prompt model</strong>
-      <p>Ollama is running, but no installed model reports both vision and text generation support.</p>
+      <p>Ollama is running, but no installed model reports text generation support.</p>
+      ${installedModels.length ? modelPicker : ""}
       <div class="h3ps-ollama-tier-heading">Choose a model for your GPU</div>
       ${renderOllamaModelTiers(status)}
       <small>Copy a command and run it in Terminal or PowerShell. This page detects the model automatically.</small>
       <details class="h3ps-ollama-storage-help" data-ollama-storage-help ${studio.ollamaStorageHelpOpen ? "open" : ""}><summary>Need models on another drive?</summary><p>Ollama manages one global model store. Set <code>OLLAMA_MODELS</code> before pulling a model, then restart Ollama. <a href="https://docs.ollama.com/windows#changing-model-location" target="_blank" rel="noopener noreferrer">Official instructions ↗</a></p></details></span>
     </div>${hostControl}`;
   }
-  const selected = ollamaModelForSettings();
   const tested = selected?.tested_for_h3 === true;
   const addModelOpen = studio.ollamaAddModelOpen === true;
   return `${header}${ollamaJourneyMarkup("ready")}<div class="h3ps-ollama-ready">
     <div class="h3ps-ollama-ready-heading"><span class="h3ps-provider-icon" data-provider-icon="ollama" aria-hidden="true"></span><span><strong>Ollama is ready</strong><small>Version ${escapeHtml(status.version || "unknown")} · ${remoteHost ? escapeHtml(studio.ollamaHost) : "local service"}</small></span><em>Running</em></div>
     <div class="h3ps-ollama-model-heading"><span>Prompt model</span><button class="h3ps-ollama-add-model-toggle" type="button" data-ollama-add-model aria-expanded="${String(addModelOpen)}">${addModelOpen ? "− Hide models" : "+ Add model"}</button></div>
-    <label class="h3ps-ollama-model-select"><select data-ollama-model>${models.map((model) => `<option value="${escapeHtml(model.remote_model)}" ${model.remote_model === selected?.remote_model ? "selected" : ""}>${escapeHtml(model.name)}${model.parameter_size ? ` · ${escapeHtml(model.parameter_size)}` : ""}${model.quantization_level ? ` · ${escapeHtml(model.quantization_level)}` : ""}</option>`).join("")}</select></label>
+    ${modelPicker}
     ${addModelOpen ? `<div class="h3ps-ollama-add-model"><strong>Choose another tested model</strong>${renderOllamaModelTiers(status)}<small>Copy a command and run it in Terminal or PowerShell. Select Refresh after the pull completes.</small></div>` : ""}
-    <div class="h3ps-ollama-badges"><span>Vision</span><span>${selected?.thinking_detected ? "Thinking detected" : "Standard generation"}</span><span class="${tested ? "is-tested" : ""}">${tested ? "Tested for H3" : "Compatible · not yet H3-tested"}</span></div>
-    <p>${tested ? "This exact Ollama tag passed the focused H3 Generate and Refine smoke test." : "Compatibility comes from Ollama model metadata. It is not a quality guarantee for H3 prompts."}</p>
+    <div class="h3ps-ollama-badges"><span>${selected?.capabilities?.images ? "Vision" : "Text only"}</span><span>${selected?.thinking_detected ? "Thinking detected" : "Standard generation"}</span><span class="${tested ? "is-tested" : ""}">${tested ? "Tested for H3" : "Compatible · not yet H3-tested"}</span></div>
+    <p>${tested ? "This exact Ollama tag passed the focused H3 Generate and Refine smoke test." : selected?.capabilities?.images ? "Compatibility comes from Ollama model metadata." : "Use this model for text-only prompts. Select a vision model to work with images or video."}</p>
     <small>Use “Keep model loaded” on the Generate page to control whether Ollama retains this model after each request.</small>
   </div>${hostControl}`;
 }
@@ -2036,7 +2132,7 @@ function syncProviderSettings() {
     panel.hidden = panel.dataset.providerPanel !== provider;
   });
   const runtimeSettings = studio.root.querySelector(".h3ps-runtime-settings");
-  runtimeSettings.hidden = !["direct", "ollama"].includes(provider);
+  runtimeSettings.hidden = !["direct", "ollama", "api"].includes(provider);
   runtimeSettings.querySelector("[data-ollama-context]").hidden = provider !== "ollama";
   const ollamaContext = runtimeSettings.querySelector("[data-ollama-context-input]");
   if (ollamaContext !== document.activeElement) ollamaContext.value = studio.ollamaContextTokens ?? "";
@@ -2046,8 +2142,10 @@ function syncProviderSettings() {
   runtimeSettings.querySelector('[data-runtime-toggle="context"]').closest(".h3ps-runtime-control").hidden = provider !== "direct";
   runtimeSettings.querySelector('[data-runtime-toggle="kv"]').closest(".h3ps-runtime-control").hidden = provider !== "direct";
   runtimeSettings.querySelector("[data-runtime-management]").textContent = provider === "ollama"
-    ? "Leave Context empty for Auto, or enter a token count within the model's limit. Generation budget sets the reply length."
-    : "Direct GGUF runtime settings are applied to the next request.";
+    ? "Leave Context empty to use the model maximum, or enter an exact token count. Generation budget sets the reply length."
+    : provider === "api"
+      ? "The provider manages context and KV cache. Set a generation budget for a reply limit."
+      : "Direct GGUF runtime settings are applied to the next request.";
 }
 
 function directModelRuntimeSuffix(model) {
@@ -2273,6 +2371,7 @@ function selectModel(model, { preserveSettingsProvider = false } = {}) {
   }
   renderInferenceSettings();
   renderMedia(studio.mode);
+  updateBriefLayout();
   setOtherModelsPopover(false);
   syncRuntimeSummary();
   syncThinkingAvailability();
@@ -2294,6 +2393,9 @@ function rememberRuntimePreferences(provider = studio.settingsProvider) {
     studio.directGenerationBudget = studio.generationBudget;
     studio.directGenerationBudgetTokens = studio.generationBudgetTokens;
     studio.directReasoningEffort = studio.reasoningEffort;
+  } else if (provider === "api") {
+    studio.directGenerationBudget = studio.generationBudget;
+    studio.directGenerationBudgetTokens = studio.generationBudgetTokens;
   } else if (provider === "ollama") {
     studio.ollamaGenerationBudget = studio.generationBudget;
     studio.ollamaGenerationBudgetTokens = studio.generationBudgetTokens;
@@ -2308,6 +2410,13 @@ function applyRuntimePreferences(provider) {
     studio.generationBudget = studio.directGenerationBudget;
     studio.generationBudgetTokens = studio.directGenerationBudgetTokens;
     studio.reasoningEffort = studio.directReasoningEffort;
+  } else if (provider === "api") {
+    studio.contextProfile = "auto";
+    studio.contextTokens = null;
+    studio.kvCache = "auto";
+    studio.generationBudget = studio.directGenerationBudget;
+    studio.generationBudgetTokens = studio.directGenerationBudgetTokens;
+    studio.reasoningEffort = "auto";
   } else {
     studio.contextProfile = "auto";
     studio.contextTokens = null;
@@ -2366,9 +2475,9 @@ function syncContextAvailability() {
 
 function syncAdvancedRuntimeControls() {
   const direct = studio.selectedModel?.family === "gguf";
+  const budgetSupported = direct || ["api", "ollama"].includes(studio.settingsProvider);
   const advanced = studio.root.querySelector("[data-direct-runtime-advanced]");
-  const ollama = studio.settingsProvider === "ollama";
-  advanced.hidden = !direct && !ollama;
+  advanced.hidden = !budgetSupported;
   const customContext = studio.root.querySelector("[data-custom-context]");
   customContext.hidden = !direct || studio.contextProfile !== "custom";
   const contextInput = studio.root.querySelector("[data-custom-context-input]");
@@ -2378,7 +2487,7 @@ function syncAdvancedRuntimeControls() {
   else contextInput.removeAttribute("max");
 
   const customBudget = studio.root.querySelector("[data-custom-generation-budget]");
-  customBudget.hidden = (!direct && !ollama) || studio.generationBudget !== "custom";
+  customBudget.hidden = !budgetSupported || studio.generationBudget !== "custom";
   studio.root.querySelector("[data-custom-generation-budget-input]").value = studio.generationBudgetTokens || "";
 
   const values = direct ? (studio.selectedModel?.reasoning_effort_values || []) : [];
@@ -2448,7 +2557,7 @@ function syncRuntimeSummary(result = null) {
     const tokens = result?.context_tokens || studio.selectedModel.server_context_tokens;
     activeSummary = tokens ? `Server · ${Math.round(tokens / 1024)}K` : "Server managed";
   } else if (studio.selectedModel?.family === "ollama") {
-    const tokens = result?.context_tokens || studio.ollamaContextTokens;
+    const tokens = result?.context_tokens || studio.ollamaContextTokens || studio.selectedModel.model_context_limit;
     activeSummary = tokens ? `Ollama · ${tokens.toLocaleString()} tokens` : "Ollama · Auto";
   } else if (studio.selectedModel?.family === "api") {
     const tokens = result?.context_limit_known ? result.context_tokens : studio.selectedModel.model_context_limit;
@@ -3997,6 +4106,7 @@ function closeStudio() {
   const modal = studio.root.querySelector(".h3ps-modal");
   if (studio.mediaEditor?.close() === false) return false;
   if (studio.mediaComposer?.close() === false) return false;
+  if (studio.canvasImagePicker?.close() === false) return false;
   studio.sequence?.leave();
   studioFocusEpoch++;
   setSettingsOpen(false);
@@ -4133,6 +4243,7 @@ function installLauncher() {
 
 document.addEventListener("keydown", (event) => {
   if (!studio?.root.classList.contains("is-open")) return;
+  if (studio.canvasImagePicker?.isOpen()) return;
   const openComposer = studio.root.querySelector(".h3ps-composer.is-open");
   const openEditor = studio.root.querySelector(".h3ps-media-editor.is-open");
   if (event.key === "Tab") {

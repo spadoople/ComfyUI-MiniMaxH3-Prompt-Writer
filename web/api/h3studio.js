@@ -14,6 +14,7 @@ function post(path, body = {}, options = {}) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    ...options,
   });
 }
 
@@ -58,6 +59,11 @@ export function uploadMedia(sessionId, mode, files, replaceAssetId = null) {
   const replace = replaceAssetId ? `?replace_asset_id=${encodeURIComponent(replaceAssetId)}` : "";
   return request(`/media/upload${replace}`, { method: "POST", body });
 }
+
+export const importComfyInputMedia = (sessionId, mode, filenames) => post(
+  "/media/import-comfy-input",
+  { session_id: sessionId, mode, filenames },
+);
 
 export const listMedia = (sessionId) => request(`/media?session_id=${encodeURIComponent(sessionId)}`);
 export async function editMedia(sessionId, assetId, options) {

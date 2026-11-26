@@ -60,7 +60,7 @@ export function normalizeCustomFrameCount(value) {
 
 function normalizeModeDraft(mode, draft) {
   if (!draft || typeof draft.brief !== "string" || typeof draft.prompt !== "string") return null;
-  const normalized = { brief: mode === "Music3" ? draft.brief.slice(0, 2000) : draft.brief, prompt: draft.prompt };
+  const normalized = { brief: draft.brief, prompt: draft.prompt };
   if (mode === "Music3") {
     normalized.lyrics = typeof draft.lyrics === "string" ? draft.lyrics.slice(0, 4000) : "";
   }
@@ -85,7 +85,12 @@ export function saveModeDrafts(storage, drafts) {
     const draft = normalizeModeDraft(mode, drafts?.[mode]);
     return draft ? [[mode, draft]] : [];
   }));
-  storage?.setItem(MODE_DRAFTS_STORAGE_KEY, JSON.stringify({ version: 1, drafts: safeDrafts }));
+  try {
+    storage?.setItem(MODE_DRAFTS_STORAGE_KEY, JSON.stringify({ version: 1, drafts: safeDrafts }));
+  } catch (error) {
+    if (error?.name !== "QuotaExceededError") throw error;
+    // The editor keeps the current draft in memory when browser storage is full.
+  }
 }
 
 export function loadUserPreferences(storage = globalThis.localStorage) {
@@ -336,6 +341,7 @@ export function restoredModelAfterDiscovery(state) {
       ? state.externalModel
       : state.preferredProvider === "ollama"
         ? state.models.find((model) => model.family === "ollama" && model.remote_model === state.ollamaModelName && model.runtime_ready)
+          || state.models.find((model) => model.family === "ollama" && model.runtime_ready && model.capabilities?.images)
           || state.models.find((model) => model.family === "ollama" && model.runtime_ready)
         : null;
   return preferredProviderModel
@@ -372,7 +378,7 @@ function sharedInferencePayload(state) {
     ...(directRuntime ? {
       context_tokens: state.contextProfile === "custom" ? state.contextTokens : null,
     } : {}),
-    ...(["gguf", "ollama"].includes(state.selectedModel?.family) ? { generation_budget: generationBudget } : {}),
+    ...(["gguf", "ollama", "api"].includes(state.selectedModel?.family) ? { generation_budget: generationBudget } : {}),
     ...(directRuntime && thinking ? { reasoning_effort: state.reasoningEffort || "auto" } : {}),
     system_prompt_override: currentSystemPromptOverride(state),
     unload_after: !state.keepModelLoaded,
