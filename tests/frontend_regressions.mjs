@@ -18,6 +18,7 @@ import "./editor_geometry.mjs";
 import "./editor_interactions.mjs";
 import "./media_tools.mjs";
 import "./workflow_media.mjs";
+import "./canvas_image_picker.mjs";
 import "./floating_media.mjs";
 
 const source = await readFile(new URL("../web/compat.js", import.meta.url), "utf8");
