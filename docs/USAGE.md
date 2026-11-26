@@ -197,6 +197,8 @@ Select **H3 Image** in the header. **Create** writes a still-image prompt from t
 
 In ComfyUI, **Import from canvas** lets you choose staged or previewed images. **Use conditioning inputs** follows file-backed inputs to the selected MiniMax H3 Image Conditioning node or subgraph and imports in the exact slot order into an empty Edit workspace. If the workflow transforms a picture before conditioning, save or preview the processed image and choose that result in **Import from canvas**.
 
+**Import from canvas** also shows Image Conveyor’s persistent shelf and staged queue files. **Use conditioning inputs** reads the enabled shelf outputs connected to the conditioning node. Choose queue files manually in **Import from canvas** to match the files you plan to run.
+
 Copy the generated text to the Conditioning node’s prompt input. Set the output size in the image workflow and bypass its prompt expander when you want H3 Image to receive the Writer’s exact wording. [MiniMax image prompting guides](https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills/h3-image-prompt-writing/references) · [ComfyUI H3 Image workflow](https://docs.comfy.org/tutorials/image/minimax/minimax-h3-image)
 
 ## Media panel

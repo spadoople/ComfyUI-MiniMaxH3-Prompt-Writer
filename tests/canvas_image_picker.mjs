@@ -3,6 +3,53 @@ import test from "node:test";
 import { Window } from "happy-dom";
 import { canvasImageSources, conditioningImageSources, createCanvasImagePicker, readCanvasImageFiles } from "../web/canvas_image_picker.js";
 
+function conveyorFixture() {
+  const image = filename => ({ filename, annotated: `characters/A & B/${filename} [input]`, type: "input" });
+  const state = {
+    output_mode: "persistent_refs", main_output_enabled: false, last_frame_output_enabled: false,
+    reference_output_enabled: [true, false, true, true],
+    reference_slots: [image("base.png"), image("disabled.png"), null, image("donor.png")],
+    items: [{ ...image("processed.png"), id: "previous", status: "processed" }],
+  };
+  const node = { id: 52, type: "ImageConveyor", widgets: [{ name: "state_json", value: JSON.stringify(state) }], outputs: [] };
+  node.outputs[6] = { name: "ref_image_1" };
+  node.outputs[7] = { name: "ref_image_2" };
+  node.outputs[8] = { name: "ref_image_3" };
+  node.outputs[9] = { name: "ref_image_4" };
+  const condition = { id: 8, type: "MiniMaxH3ImageConditioning", inputs: [
+    { name: "images.image_4", link: 44 }, { name: "images.image_2", link: 42 },
+    { name: "images.image_1", link: 41 }, { name: "images.image_3", link: 43 },
+  ] };
+  const links = Object.fromEntries([6, 7, 8, 9].map((slot, index) => [41 + index, { origin_id: 52, origin_slot: slot }]));
+  const app = { graph: { _nodes: [node, condition], links }, canvas: { selectedItems: new Set([node]) } };
+  return { app, node, state };
+}
+
+test("canvas picker lists the Conveyor shelf and staged queue files from the current widget", () => {
+  const { app, node } = conveyorFixture();
+  node.type = "SequentialBatchImageLoader";
+  const sources = canvasImageSources(app);
+  assert.deepEqual(sources.map(source => source.filename), ["base.png", "disabled.png", "donor.png", "processed.png"]);
+  assert.ok(sources.every(source => source.type === "input" && source.subfolder === "characters/A & B"));
+  assert.deepEqual(sources.map(source => source.selected), [true, false, true, false]);
+});
+
+test("wired Conveyor shelf outputs follow conditioning order and skip empty or disabled slots", () => {
+  const { app, node } = conveyorFixture();
+  assert.deepEqual(conditioningImageSources(app).map(source => source.filename), ["base.png", "donor.png"]);
+  node.properties = { image_conveyor_reference_enabled: [false, true, true, true] };
+  assert.deepEqual(conditioningImageSources(app).map(source => source.filename), ["disabled.png", "donor.png"]);
+});
+
+test("Conveyor queue-group files are selectable without guessing the next wired execution", () => {
+  const { app, node, state } = conveyorFixture();
+  state.output_mode = "queue_group";
+  state.items.push({ id: "bad", annotated: "../external.png [input]", source_path: "C:/external.png", status: "pending" });
+  node.widgets[0].value = JSON.stringify(state);
+  assert.deepEqual(canvasImageSources(app).map(source => source.filename), ["processed.png"]);
+  assert.throws(() => conditioningImageSources(app), /queue-driven image.*Import from canvas/);
+});
+
 test("conditioning import follows numeric slots and resolves exposed subgraph inputs", () => {
   const load = (id, value) => ({ id, type: "LoadImage", widgets: [{ name: "image", value }] });
   const condition = { id: 7, type: "MiniMaxH3ImageConditioning", inputs: [
