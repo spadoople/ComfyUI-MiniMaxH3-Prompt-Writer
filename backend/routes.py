@@ -21,6 +21,7 @@ from .catalog import discover_models_with_diagnostics, find_model, model_setup_c
 from .comfy_state import comfyui_runtime_snapshot
 from .devlog import DEVELOPER_MODE, LOG_PATH, PeakVRAMMonitor, gpu_memory_snapshot, write_event
 from .guides import MODE_GUIDES, guide_catalog, guide_for_mode
+from .image_modes import IMAGE_MODES
 from .media import CACHE_ROOT, MAX_FILE_BYTES, MODE_LIMITS, STORE, MediaError, media_type, parse_session_id
 from .media_editor import browser_source, commit_edit, prepare_edit, video_frame
 from .memory import assess_free_vram
@@ -36,7 +37,7 @@ from .sequence_routes import register_sequence_routes
 
 
 ROUTE_PREFIX = "/h3studio"
-MODES = {"T2VA", "I2VA", "FL2VA", "L2VA", "Reference", "Music3"}
+MODES = {"T2VA", "I2VA", "FL2VA", "L2VA", "Reference", "Music3", *IMAGE_MODES}
 STATE: dict[str, Any] = {
     "phase": "idle",
     "active_request_id": None,
@@ -660,7 +661,9 @@ async def get_system_prompt(request: web.Request) -> web.Response:
         return _error(error.code, error.message, status=404)
     return web.json_response({
         "mode": mode,
-        "profile": "music3_lyrics" if mode == "Music3Lyrics" else "music3" if mode == "Music3" else "reference" if mode == "Reference" else "standard",
+        "profile": mode if mode in IMAGE_MODES else {
+            "Music3Lyrics": "music3_lyrics", "Music3": "music3", "Reference": "reference",
+        }.get(mode, "standard"),
         "system_prompt": prompt,
     })
 
@@ -686,11 +689,16 @@ async def generate(request: web.Request) -> web.Response:
     if body is None:
         return _error("INVALID_REQUEST", "Expected a JSON object.", status=400)
 
-    required = ("mode", "creative_brief", "model_id", "session_id") if body.get("mode") == "Music3" else ("mode", "creative_brief", "model_id", "session_id", "aspect_ratio", "duration_seconds")
+    mode = body.get("mode")
+    required = ("mode", "creative_brief", "model_id", "session_id")
+    if mode != "Music3":
+        required += ("aspect_ratio",)
+        if not isinstance(mode, str) or mode not in IMAGE_MODES:
+            required += ("duration_seconds",)
     missing = [key for key in required if not body.get(key)]
     if missing:
         return _error("INVALID_REQUEST", "Required fields are missing.", status=400, details={"fields": missing})
-    if body["mode"] not in MODES:
+    if not isinstance(mode, str) or mode not in MODES:
         return _error("INVALID_MODE", "The selected MiniMax mode is not supported.", status=400)
 
     if not isinstance(body.get("thinking", False), bool) or not isinstance(body.get("unload_after", True), bool):

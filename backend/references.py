@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .image_modes import IMAGE_EDIT
+
 
 CANONICAL_REFERENCE_TAG = re.compile(r"<(Picture|Video|Audio) ([1-9]\d*)>")
 REFERENCE_TAG = re.compile(r"<\s*(Picture|Video|Audio)\s+(\d+)\s*>", re.IGNORECASE)
@@ -32,6 +34,9 @@ class ReferencePolicy:
 
 
 def reference_policy(request_input: dict[str, Any]) -> ReferencePolicy:
+    if request_input.get("mode") == IMAGE_EDIT:
+        assets = request_input.get("media_manifest", {}).get("assets", [])
+        return ReferencePolicy(set(), set(), {asset["reference"] for asset in assets if asset.get("reference")})
     if request_input.get("mode") != "Reference":
         return ReferencePolicy(set(), set(), set())
 

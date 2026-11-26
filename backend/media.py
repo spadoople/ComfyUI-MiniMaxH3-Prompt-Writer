@@ -12,6 +12,8 @@ import av
 import folder_paths
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from .image_modes import IMAGE_CREATE, IMAGE_EDIT, IMAGE_REFERENCE_LIMIT
+
 
 CACHE_ROOT = Path(folder_paths.get_temp_directory()) / "h3_prompt_studio"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -28,6 +30,8 @@ MODE_LIMITS = {
     "FL2VA": {"image": 2},
     "L2VA": {"image": 1},
     "Reference": REFERENCE_LIMITS,
+    IMAGE_CREATE: {},
+    IMAGE_EDIT: {"image": IMAGE_REFERENCE_LIMIT},
 }
 
 
@@ -470,7 +474,7 @@ class MediaStore:
                 asset["reference"] = None
                 continue
             per_type[asset["type"]] += 1
-            if mode == "Reference":
+            if mode in {"Reference", IMAGE_EDIT}:
                 names = {"image": "Picture", "video": "Video", "audio": "Audio"}
                 asset["reference"] = f"<{names[asset['type']]} {per_type[asset['type']]}>"
             elif mode == "FL2VA":

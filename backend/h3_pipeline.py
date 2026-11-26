@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import time
 from typing import Any, Callable
 
@@ -11,6 +12,7 @@ from .context import (
     non_thinking_output_tokens,
 )
 from .media import STORE, MediaError
+from .image_modes import IMAGE_CREATE, IMAGE_EDIT, IMAGE_MODES
 from .models.contract import ModelError, final_message_text
 from .prompt_audit import audit_prompt, camera_structure_requested
 from .prompt_repair import (
@@ -22,6 +24,10 @@ from .prompt_repair import (
     unexpected_audio_task,
 )
 from .references import ReferencePolicy, reference_policy, reference_tags
+
+IMAGE_VIDEO_FORMAT = re.compile(
+    r"(?im)^\s*(?:\[Shot\s+\d+\]|(?:integrated_multimodal_description|overall_soundscape|non_diegetic_music):)"
+)
 
 def _asset_data_uri(session_id: str, asset_id: str, representation: str) -> str:
     try:
@@ -187,7 +193,12 @@ def _audit(
     unexpected_reference_tags = sorted(actual_reference_tags - policy.allowed)
     has_unexpected_audio_task = unexpected_audio_task(result.get("task_label"), actual_reference_tags)
     constraint_violations = explicit_constraint_violations(intent_text, prompt)
-    if assembled["input"]["mode"] == "Reference":
+    mode = assembled["input"]["mode"]
+    if mode in IMAGE_MODES:
+        result["unexpected_reference_tags"] = unexpected_reference_tags
+        result["video_format_in_image_prompt"] = bool(IMAGE_VIDEO_FORMAT.search(prompt))
+        result["repair_required"] = bool(unexpected_reference_tags or result["video_format_in_image_prompt"])
+    if mode == "Reference":
         result["missing_reference_tags"] = missing_reference_tags
         result["unexpected_reference_tags"] = unexpected_reference_tags
         result["required_reference_tags"] = sorted(policy.required)
@@ -210,15 +221,15 @@ def validate_media_capabilities(model_info: dict[str, Any], assembled: dict[str,
     if (
         model_info.get("family") == "gguf"
         and model_info.get("capabilities", {}).get("images") is False
-        and mode not in {"T2VA", "Music3"}
+        and mode not in {"T2VA", "Music3", IMAGE_CREATE}
     ):
         raise ModelError(
             "DIRECT_VISION_REQUIRED",
-            "This Direct GGUF model is running without a compatible vision projector. T2VA and Music3 are available.",
+            "This Direct GGUF model is running without a compatible vision projector. T2VA, Music3 and Image Create are available.",
             {
                 "mode": mode,
-                "supported_modes": ["T2VA", "Music3"],
-                "suggestion": "Switch to T2VA or Music3, or add the matching mmproj GGUF beside the model.",
+                "supported_modes": ["T2VA", "Music3", IMAGE_CREATE],
+                "suggestion": "Select a text-only mode or add the matching mmproj GGUF beside the model.",
             },
         )
     required = {item["requires_capability"] for item in assembled["media_inputs"]}
@@ -350,7 +361,7 @@ def run_h3_pipeline(
                 "media_processing_seconds": round(media_processing_seconds, 3), **media_metrics,
                 "thinking_fallback": False, "format_repair_attempted": False,
                 "primary_finish_reason": primary_finish_reason, "seed": seed}
-    initial_audit, reference_policy_value, intent_text, duration_seconds, camera_structure_allowed = _audit(
+    initial_audit, reference_policy_value, _intent_text, duration_seconds, _camera_structure_allowed = _audit(
         prompt,
         assembled,
     )
@@ -364,7 +375,8 @@ def run_h3_pipeline(
     format_repair_reason = None
     format_repair_failure = None
     format_repair_method = None
-    repair_needed = assembled["input"]["mode"] == "Reference" and initial_audit.get("repair_required") is True
+    mode = assembled["input"]["mode"]
+    repair_needed = (mode == "Reference" or mode in IMAGE_MODES) and initial_audit.get("repair_required") is True
     if repair_needed:
         format_repair_attempted = True
         failed_checks = audit_failures(initial_audit)
@@ -373,7 +385,15 @@ def run_h3_pipeline(
         has_prepared_visual_media = any(
             item.get("type") in {"image", "video"} for item in assembled.get("media_inputs", [])
         )
-        if missing_active_references and has_prepared_visual_media:
+        if mode in IMAGE_MODES:
+            format_repair_method = "image prompt correction"
+            allowed = ", ".join(sorted(allowed_reference_tags)) or "none"
+            repair_messages = [*messages, {"role": "assistant", "content": prompt}, {"role": "user", "content": (
+                "Rewrite the draft as one plain-text still-image prompt. Preserve the requested edit, exact visible wording "
+                "and valid source roles. Remove video formatting and any reference to a nonexistent picture. "
+                f"The only available picture tags are {allowed}. Return just the corrected prompt."
+            )}]
+        elif missing_active_references and has_prepared_visual_media:
             format_repair_method = "multimodal reference correction"
             repair_messages = multimodal_repair_messages(
                 messages,
@@ -418,37 +438,17 @@ def run_h3_pipeline(
             thinking=False,
             qwen_reasoning_contract=qwen_reasoning_contract,
         )
-        repaired_audit = audit_prompt(
-            repaired,
-            assembled["input"]["mode"],
-            duration_seconds,
-            camera_structure_allowed,
-        )
+        repaired_audit = _audit(repaired, assembled)[0]
         repaired_tags = reference_tags(repaired)
-        repaired_audit["missing_reference_tags"] = sorted(expected_reference_tags - repaired_tags)
-        repaired_audit["unexpected_reference_tags"] = sorted(repaired_tags - allowed_reference_tags)
-        repaired_audit["required_reference_tags"] = sorted(reference_policy_value.required)
-        repaired_audit["mutable_reference_tags"] = sorted(reference_policy_value.mutable)
-        repaired_audit["allowed_reference_tags"] = sorted(reference_policy_value.allowed)
-        repaired_audit["unexpected_audio_task"] = unexpected_audio_task(
-            repaired_audit.get("task_label"), repaired_tags
-        )
-        repaired_audit["explicit_constraint_violations"] = explicit_constraint_violations(intent_text, repaired)
-        repaired_audit["repair_required"] = bool(
-            repaired_audit.get("repair_required")
-            or repaired_audit["missing_reference_tags"]
-            or repaired_audit["unexpected_reference_tags"]
-            or repaired_audit["unexpected_audio_task"]
-            or repaired_audit["explicit_constraint_violations"]
-        )
-        repair_tags_match = repaired_tags == repair_reference_tags
+        repair_tags_match = (repair_reference_tags <= repaired_tags if mode in IMAGE_MODES
+                             else repaired_tags == repair_reference_tags)
         dialogue_preserved = dialogue_lines(repaired) == dialogue_lines(prompt)
         if (
             repaired
             and repair_finish_reason != "length"
             and repaired_audit.get("repair_required") is False
             and repair_tags_match
-            and dialogue_preserved
+            and (mode in IMAGE_MODES or dialogue_preserved)
         ):
             prompt = repaired
             format_repair_applied = True
@@ -465,6 +465,11 @@ def run_h3_pipeline(
         usage["prompt_tokens"] = int(usage.get("prompt_tokens", 0)) + int(repair_usage.get("prompt_tokens", 0))
         usage["completion_tokens"] = int(usage.get("completion_tokens", 0)) + format_repair_tokens
 
+    if mode in IMAGE_MODES and initial_audit.get("repair_required"):
+        raise ModelError("INVALID_IMAGE_PROMPT", "The writer could not produce a valid image prompt. "
+                         + "; ".join(audit_failures(initial_audit)), initial_audit)
+    if mode == IMAGE_EDIT:
+        prompt = re.sub(r"<\s*picture\s+(\d+)\s*>", r"<Picture \1>", prompt, flags=re.IGNORECASE)
     generation_seconds = time.perf_counter() - generation_started
     output_tokens = int(usage.get("completion_tokens", 0))
     return {
@@ -484,7 +489,8 @@ def run_h3_pipeline(
         "format_repair_reason": format_repair_reason,
         "format_repair_failure": format_repair_failure,
         "format_repair_method": format_repair_method,
-        "format_repair_multimodal": format_repair_method == "multimodal reference correction",
+        "format_repair_multimodal": format_repair_method == "multimodal reference correction"
+        or (mode == IMAGE_EDIT and format_repair_attempted),
         "format_repair_tokens": format_repair_tokens,
         "seed": seed,
         "tokens_per_second": round(output_tokens / generation_seconds, 2) if generation_seconds > 0 else 0,

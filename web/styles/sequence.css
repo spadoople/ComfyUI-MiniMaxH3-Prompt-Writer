@@ -96,3 +96,6 @@
 .h3ps-sequence-highlights::highlight(h3ps-sequence-dialogue){background-color:rgba(218,121,176,.11);color:transparent}
 
 .h3ps-sequence-instructions-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.h3ps-root.is-image .h3ps-sequence-selector,
+.h3ps-root.is-image [data-open-composer],
+.h3ps-root.is-image [data-compose-separator] { display: none; }

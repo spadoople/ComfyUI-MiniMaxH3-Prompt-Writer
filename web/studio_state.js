@@ -9,13 +9,20 @@ export const USER_PREFERENCES_STORAGE_KEY = "h3ps-preferences-v1";
 export const MODE_DRAFTS_STORAGE_KEY = "h3ps-mode-drafts-v1";
 export const INTERFACE_SIZES = ["100", "110", "120", "125"];
 
-const MODES = ["T2VA", "I2VA", "FL2VA", "L2VA", "Reference", "Music3"];
+export const VIDEO_MODES = ["T2VA", "I2VA", "FL2VA", "L2VA", "Reference"];
+export const IMAGE_MODES = ["ImageCreate", "ImageEdit"];
+export const IMAGE_REFERENCE_LIMIT = 16;
+const MODES = [...VIDEO_MODES, ...IMAGE_MODES, "Music3"];
 const ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9"];
 const PROVIDERS = ["direct", "external", "ollama", "api"];
 const CONTEXT_PROFILES = ["auto", "low", "standard", "extended", "large", "maximum", "custom"];
 const KV_CACHES = ["auto", "f16", "q8"];
 const GENERATION_BUDGETS = ["auto", "2048", "4096", "8192", "custom"];
-const DRAFT_MODES = ["T2VA", "I2VA", "FL2VA", "L2VA", "Reference", "Music3"];
+const DRAFT_MODES = MODES;
+
+export function isImageMode(mode) {
+  return IMAGE_MODES.includes(mode);
+}
 
 export function isPersistedDraftMode(mode) {
   return DRAFT_MODES.includes(mode);
@@ -31,6 +38,8 @@ export function isTextOnlyDirectModel(model) {
 }
 
 export function isGenerationModeAvailable(model, mode) {
+  if (mode === "ImageEdit") return model?.capabilities?.images !== false;
+  if (mode === "ImageCreate") return true;
   return !isTextOnlyDirectModel(model) || mode === "T2VA" || mode === "Music3";
 }
 
@@ -279,6 +288,7 @@ export function saveCustomSystemPrompts(storage, prompts) {
 }
 
 export function systemPromptProfile(mode) {
+  if (isImageMode(mode)) return mode;
   if (mode === "Music3Lyrics") return "music3_lyrics";
   if (mode === "Music3") return "music3";
   return mode === "Reference" || mode === "reference" ? "reference" : "standard";
@@ -388,7 +398,7 @@ function sharedInferencePayload(state) {
 export function buildGeneratePayload(state, { creativeBrief, lyrics = "", seed }) {
   const payload = {
     ...sharedInferencePayload(state),
-    duration_seconds: state.durationSeconds,
+    ...(!isImageMode(state.mode) ? { duration_seconds: state.durationSeconds } : {}),
     aspect_ratio: state.aspectRatio,
     creative_brief: creativeBrief,
     seed,
@@ -402,7 +412,7 @@ export function buildRefinePayload(state, { currentPrompt, instruction, creative
     ...sharedInferencePayload(state),
     current_prompt: currentPrompt,
     instruction,
-    duration_seconds: state.durationSeconds,
+    ...(!isImageMode(state.mode) ? { duration_seconds: state.durationSeconds } : {}),
     aspect_ratio: state.aspectRatio,
     creative_brief: creativeBrief,
     seed,
@@ -435,7 +445,8 @@ export function createStudioState({ sessionId, storage = globalThis.localStorage
   const ollamaHost = loadOllamaHost(storage);
   return {
     mode: preferences?.mode || "Reference",
-    lastVideoMode: preferences?.mode && preferences.mode !== "Music3" ? preferences.mode : "Reference",
+    lastVideoMode: VIDEO_MODES.includes(preferences?.mode) ? preferences.mode : "Reference",
+    lastImageMode: isImageMode(preferences?.mode) ? preferences.mode : "ImageCreate",
     mediaFilter: "all",
     durationSeconds: preferences?.duration_seconds || 10,
     aspectRatio: preferences?.aspect_ratio || "16:9",

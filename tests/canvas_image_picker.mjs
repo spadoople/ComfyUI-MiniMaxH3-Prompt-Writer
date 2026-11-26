@@ -1,7 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Window } from "happy-dom";
-import { canvasImageSources, createCanvasImagePicker, readCanvasImageFiles } from "../web/canvas_image_picker.js";
+import { canvasImageSources, conditioningImageSources, createCanvasImagePicker, readCanvasImageFiles } from "../web/canvas_image_picker.js";
+
+test("conditioning import follows numeric slots and resolves exposed subgraph inputs", () => {
+  const load = (id, value) => ({ id, type: "LoadImage", widgets: [{ name: "image", value }] });
+  const condition = { id: 7, type: "MiniMaxH3ImageConditioning", inputs: [
+    { name: "images.image_10", link: 10 }, { name: "images.image_1", link: 11 },
+    { name: "images.image_3", link: 12 }, { name: "images.image_2", link: 13 },
+  ] };
+  const subgraph = { id: "child", _nodes: [condition, load(6, "local.png")], links: new Map([
+    [10, { origin_id: -10, origin_slot: 2 }], [11, { origin_id: -10, origin_slot: 0 }],
+    [12, { origin_id: 6, origin_slot: 0 }], [13, { origin_id: -10, origin_slot: 1 }],
+  ]) };
+  const owner = { id: 3, subgraph, inputs: [{ link: 20 }, { link: null }, { link: 21 }] };
+  const root = { id: "parent", _nodes: [load(1, "base.png"), load(2, "donor.png"), owner], links: {
+    20: { origin_id: 1, origin_slot: 0 }, 21: { origin_id: 2, origin_slot: 0 },
+  } };
+  const app = { graph: root, canvas: { selectedItems: new Set([owner]) } };
+  assert.deepEqual(conditioningImageSources(app).map(source => source.filename), ["base.png", "local.png", "donor.png"]);
+  root._nodes[1].type = "CropImage";
+  assert.throws(() => conditioningImageSources(app), /image_10.*processed image/);
+});
+
+test("conditioning import requires a single target and preserves duplicate picture slots", () => {
+  const node = { id: 1, type: "LoadImage", widgets: [{ name: "image", value: "repeat.png" }] };
+  const input = { name: "images.image_1", link: 21 };
+  const first = { id: 2, type: "MiniMaxH3ImageConditioning", inputs: [input, { name: "image_2", link: 22 }] };
+  const second = { id: 3, type: "MiniMaxH3ImageConditioning", inputs: [input] };
+  const app = { graph: { _nodes: [node, first, second], links: {
+    21: { origin_id: 1, origin_slot: 0 }, 22: { origin_id: 1, origin_slot: 0 },
+  } }, canvas: { selectedItems: new Set() } };
+  assert.throws(() => conditioningImageSources(app), /Select one MiniMax H3 Image Conditioning/);
+  app.canvas.selectedItems.add(first);
+  assert.deepEqual(conditioningImageSources(app).map(source => source.filename), ["repeat.png", "repeat.png"]);
+});
 
 test("finds staged inputs and completed image outputs across the workflow", () => {
   const load = (id, value, comfyClass = "LoadImage") => ({ id, comfyClass, widgets: [{ name: "image", value }] });

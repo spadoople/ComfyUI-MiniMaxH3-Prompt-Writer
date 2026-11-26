@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .image_modes import IMAGE_SYSTEM_PROMPTS
 from .text_normalization import normalize_unicode_text
 
 
@@ -20,6 +21,8 @@ class SystemPromptError(ValueError):
 
 
 def system_prompt_for_mode(mode: str) -> str:
+    if mode in IMAGE_SYSTEM_PROMPTS:
+        return IMAGE_SYSTEM_PROMPTS[mode]
     if mode not in {"T2VA", "I2VA", "FL2VA", "L2VA", "Reference", "Music3", "Music3Lyrics"}:
         raise SystemPromptError("INVALID_MODE", "The selected MiniMax mode is not supported.")
     if mode == "Music3Lyrics":

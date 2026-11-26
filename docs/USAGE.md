@@ -191,6 +191,14 @@ In Reference mode, open **Actions > Compose** to combine existing pictures and v
 
 **Add as Picture** adds the collage as a new, independent Picture. You can also download or copy the PNG. Later changes to the source media do not update an existing collage.
 
+## H3 Image
+
+Select **H3 Image** in the header. **Create** writes a still-image prompt from the creative brief and aspect ratio. A text-only prompt model can handle this mode. **Edit** uses a vision-capable model and up to 16 pictures. Add the base as `<Picture 1>` and arrange the remaining pictures in the order they reach MiniMax H3 Image Conditioning.
+
+In ComfyUI, **Import from canvas** lets you choose staged or previewed images. **Use conditioning inputs** follows file-backed inputs to the selected MiniMax H3 Image Conditioning node or subgraph and imports in the exact slot order into an empty Edit workspace. If the workflow transforms a picture before conditioning, save or preview the processed image and choose that result in **Import from canvas**.
+
+Copy the generated text to the Conditioning node’s prompt input. Set the output size in the image workflow and bypass its prompt expander when you want H3 Image to receive the Writer’s exact wording. [MiniMax image prompting guides](https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills/h3-image-prompt-writing/references) · [ComfyUI H3 Image workflow](https://docs.comfy.org/tutorials/image/minimax/minimax-h3-image)
+
 ## Media panel
 
 In Single → Reference, select **Import from canvas** to reuse images from **Load Image** nodes and completed **Preview Image** or **Save Image** nodes in the current workflow. Select the thumbnails you want and use the arrows to set their Picture numbers. Writer appends them after any existing Pictures, within the Reference limits. Selecting nodes on the canvas before opening Writer preselects their images in the picker.

@@ -1,6 +1,15 @@
 const IMAGE_LOADERS = new Set(["LoadImage", "LoadImageOutput"]);
 const IMAGE_OUTPUTS = new Set(["PreviewImage", "SaveImage"]);
 
+function loaderImage(node, type) {
+  return imageLocation(node.widgets?.find(widget => widget.name === "image")?.value,
+    type === "LoadImageOutput" ? "output" : "input");
+}
+
+function selectedNodes(app) {
+  return app.canvas?.selectedItems ?? new Set(Object.values(app.canvas?.selected_nodes || {}));
+}
+
 function imageLocation(path, folder = "input", subfolder = "") {
   if (typeof path !== "string" || !path.trim()) return null;
   const annotation = path.match(/ \[(input|output|temp)\]$/);
@@ -17,7 +26,7 @@ function imageLocation(path, folder = "input", subfolder = "") {
 
 export function canvasImageSources(app) {
   const graph = app.rootGraphOrUndefined || app.graph;
-  const selected = app.canvas?.selectedItems ?? new Set(Object.values(app.canvas?.selected_nodes || {}));
+  const selected = selectedNodes(app);
   const candidates = new Map();
   const visited = new Set();
 
@@ -30,7 +39,7 @@ export function canvasImageSources(app) {
       const outputKey = prefix && graph.id ? `${graph.id}:${node.id}` : node.id;
       const images = IMAGE_OUTPUTS.has(type) ? app.nodeOutputs?.[outputKey]?.images ?? node.images : null;
       const sources = IMAGE_LOADERS.has(type)
-        ? [imageLocation(node.widgets?.find(widget => widget.name === "image")?.value, type === "LoadImageOutput" ? "output" : "input")]
+        ? [loaderImage(node, type)]
         : (Array.isArray(images) ? images.map(image => imageLocation(image?.filename, image?.type ?? "output", image?.subfolder)) : []);
       for (const source of sources) {
         if (!source) continue;
@@ -46,6 +55,83 @@ export function canvasImageSources(app) {
 
   visit(graph);
   return [...candidates.values()];
+}
+
+function graphLink(graph, id) {
+  return graph.getLink?.(id) ?? graph.links?.get?.(id) ?? graph.links?.[id] ?? graph._links?.get?.(id);
+}
+
+export function conditioningImageSources(app) {
+  const root = app.rootGraphOrUndefined || app.graph;
+  const selected = selectedNodes(app);
+  const candidates = [];
+
+  function visit(graph, parent = null, owner = null) {
+    if (!graph) return;
+    for (let ancestor = parent; ancestor; ancestor = ancestor.parent) if (ancestor.graph === graph) return;
+    const context = { graph, parent, owner, selected: selected.has(owner) || Boolean(parent?.selected) };
+    for (const node of graph.nodes ?? graph._nodes ?? []) {
+      if ((node.comfyClass || node.type) === "MiniMaxH3ImageConditioning") candidates.push({ node, context });
+      if (node.subgraph) visit(node.subgraph, context, node);
+    }
+  }
+
+  function trace(context, id, seen = new Set()) {
+    if (id == null) return null;
+    const { graph, parent, owner } = context;
+    const key = `${graph.id ?? "root"}:${id}`;
+    if (seen.has(key)) throw new Error("a link loops back on itself");
+    seen.add(key);
+    const link = graphLink(graph, id);
+    if (!link) throw new Error("its connection is unavailable");
+    if (parent && String(link.origin_id) === String(graph.inputNode?.id ?? -10)) {
+      return trace(parent, owner.inputs?.[link.origin_slot]?.link, seen);
+    }
+    const node = graph.getNodeById?.(link.origin_id)
+      ?? (graph.nodes ?? graph._nodes ?? []).find(item => String(item.id) === String(link.origin_id));
+    if (!node) throw new Error("its source node is unavailable");
+    const type = node.comfyClass || node.type;
+    const label = `${node.title || type} #${node.id}`;
+    if (IMAGE_LOADERS.has(type) && Number(link.origin_slot) === 0) {
+      const source = loaderImage(node, type);
+      if (source) return { ...source, label, selected: true };
+      throw new Error(`${label} has no selected file`);
+    }
+    if (/^(?:Reroute|Reroute \(rgthree\))$/i.test(type)) {
+      return trace(context, node.inputs?.[0]?.link, seen);
+    }
+    if (node.subgraph) {
+      const subgraph = node.subgraph;
+      const output = subgraph.outputs?.[link.origin_slot];
+      const innerLink = subgraph.outputNode?.inputs?.[link.origin_slot]?.link ?? output?.linkIds?.[0];
+      if (innerLink != null) return trace({ graph: subgraph, parent: context, owner: node }, innerLink, seen);
+    }
+    throw new Error(`${label} produces a processed image. Use a saved or previewed result with Import from canvas`);
+  }
+
+  visit(root);
+  const chosen = candidates.filter(({ node, context }) => selected.has(node) || context.selected);
+  const matches = chosen.length ? chosen : candidates;
+  if (matches.length !== 1) {
+    throw new Error(matches.length
+      ? "Select one MiniMax H3 Image Conditioning node, or its containing subgraph."
+      : "Add a MiniMax H3 Image Conditioning node to this workflow.");
+  }
+  const { node, context } = matches[0];
+  const slots = (node.inputs || []).flatMap(input => {
+    const match = input.name?.match(/^(?:images\.)?image_(\d+)$/);
+    return match && input.link != null ? [{ number: Number(match[1]), link: input.link }] : [];
+  }).sort((left, right) => left.number - right.number);
+  const sources = slots.flatMap(slot => {
+    try {
+      const source = trace(context, slot.link);
+      return source ? [{ ...source, label: `image_${slot.number} · ${source.label}` }] : [];
+    } catch (error) {
+      throw new Error(`Could not import image_${slot.number}. ${error.message}.`);
+    }
+  });
+  if (!sources.length) throw new Error("Connect an image to MiniMax H3 Image Conditioning first.");
+  return sources;
 }
 
 function imageRoute({ filename, subfolder, type }) {
@@ -92,6 +178,7 @@ export function createCanvasImagePicker({ root, viewUrl, onImport, getCapacity }
   let rows = [];
   let ordered = [];
   let busy = false;
+  let fixedOrder = false;
 
   function sync() {
     const { pictureCount, remaining } = getCapacity();
@@ -102,9 +189,9 @@ export function createCanvasImagePicker({ root, viewUrl, onImport, getCapacity }
     displayed.forEach((row, position) => {
       const index = ordered.indexOf(row);
       row.order.textContent = index < 0 ? "" : `Picture ${pictureCount + index + 1}`;
-      row.checkbox.disabled = busy || (index < 0 && ordered.length >= remaining);
+      row.checkbox.disabled = busy || fixedOrder || (index < 0 && ordered.length >= remaining);
       row.checkbox.checked = index >= 0;
-      row.up.hidden = row.down.hidden = index < 0;
+      row.up.hidden = row.down.hidden = fixedOrder || index < 0;
       row.up.disabled = busy || index <= 0;
       row.down.disabled = busy || index >= ordered.length - 1;
       if (list.children[position] !== row.element) list.insertBefore(row.element, list.children[position] ?? null);
@@ -186,14 +273,16 @@ export function createCanvasImagePicker({ root, viewUrl, onImport, getCapacity }
   });
 
   return {
-    open(sources) {
+    open(sources, { keepOrder = false } = {}) {
       if (dialog.open) return;
       list.replaceChildren();
       rows = sources.map(makeRow);
       const { remaining } = getCapacity();
-      ordered = rows.filter(row => row.source.selected).slice(0, remaining);
+      fixedOrder = keepOrder;
+      ordered = keepOrder ? rows : rows.filter(row => row.source.selected).slice(0, remaining);
       status.textContent = "";
-      hint.textContent = !sources.length ? "Add a Load Image or run a Preview Image or Save Image node first."
+      hint.textContent = keepOrder ? "Import the connected images in the conditioning node’s Picture order."
+        : !sources.length ? "Add a Load Image or run a Preview Image or Save Image node first."
         : remaining === 0 ? "Remove a reference before importing more pictures."
         : `Select up to ${remaining} ${remaining === 1 ? "image" : "images"}. Move selections up or down to set their Picture numbers.`;
       sync();

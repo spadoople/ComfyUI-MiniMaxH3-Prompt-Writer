@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { draftFile, draftFilename, parseDraft } from "../web/draft_files.js";
 import { newSequence } from "../web/sequence_state.js";
-import { buildGeneratePayload, buildRefinePayload } from "../web/studio_state.js";
+import { buildGeneratePayload, buildRefinePayload, systemPromptProfile } from "../web/studio_state.js";
 
 test("draft filenames identify the workspace and local save time",()=>{
   const now = new Date(2026,8,21,14,3,8);
@@ -20,8 +20,8 @@ test("Save downloads a loadable draft with a timestamp and no model configuratio
     const state={mode:"Reference",assets:[{id:"a",mode:"Reference",reference:"<Picture 1>",filename:"portrait.png"}],
       sequence:{active:kind === "sequence",state:newSequence()},customSystemPrompts:{reference:"Custom instructions"},
       durationSeconds:8,aspectRatio:"9:16",apiKey:"not exported"};
-    const save=new Function("studio","currentDraftFields","draftFile","draftFilename","Blob","URL","document","setTimeout","showToast",saveSource+";return saveTextDraft;")(
-      state,()=>({brief:"Test brief",prompt:"Test prompt"}),draftFile,draftFilename,Blob,
+    const save=new Function("studio","currentDraftFields","draftFile","draftFilename","systemPromptProfile","Blob","URL","document","setTimeout","showToast",saveSource+";return saveTextDraft;")(
+      state,()=>({brief:"Test brief",prompt:"Test prompt"}),draftFile,draftFilename,systemPromptProfile,Blob,
       {createObjectURL(value){blob=value;return "blob:test";},revokeObjectURL(){}},
       {createElement(){return link;}},fn=>fn(),()=>assert.fail("Save must succeed"));
     save();

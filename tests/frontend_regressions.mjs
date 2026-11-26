@@ -20,6 +20,29 @@ import "./media_tools.mjs";
 import "./workflow_media.mjs";
 import "./canvas_image_picker.mjs";
 import "./floating_media.mjs";
+import { buildGeneratePayload as imageGeneratePayload, buildRefinePayload as imageRefinePayload, createStudioState as imageStudioState, isGenerationModeAvailable as imageAvailability } from "../web/studio_state.js";
+import { draftFile as imageDraftFile } from "../web/draft_files.js";
+
+test("image modes use their own system overrides and omit video duration", () => {
+  const state = imageStudioState({ sessionId: "fixture", storage: null });
+  const textOnly = { family: "ollama", capabilities: { images: false } };
+  state.mode = "ImageCreate";
+  state.selectedModel = textOnly;
+  state.customSystemPrompts = { ImageCreate: "Write the finished still.", ImageEdit: "Preserve the base." };
+  assert.equal(imageAvailability(textOnly, state.mode), true);
+  const create = imageGeneratePayload(state, { creativeBrief: "A red boat", seed: 9 });
+  assert.equal(create.mode, "ImageCreate");
+  assert.equal(create.system_prompt_override, "Write the finished still.");
+  assert.equal(Object.hasOwn(create, "duration_seconds"), false);
+  state.mode = "ImageEdit";
+  assert.equal(imageAvailability(textOnly, state.mode), false);
+  const edit = imageRefinePayload(state, { currentPrompt: "A red boat", instruction: "Make it blue", creativeBrief: "A boat", seed: 9 });
+  assert.equal(edit.system_prompt_override, "Preserve the base.");
+  assert.equal(Object.hasOwn(edit, "duration_seconds"), false);
+  const draft = imageDraftFile("single", { mode: "ImageEdit", aspectRatio: "3:4", brief: "A boat", prompt: "A red boat", instructions: null });
+  assert.equal(draft.content.mode, "ImageEdit");
+  assert.equal(Object.hasOwn(draft.content, "duration"), false);
+});
 
 const source = await readFile(new URL("../web/compat.js", import.meta.url), "utf8");
 const encoded = Buffer.from(source).toString("base64");
@@ -1541,7 +1564,7 @@ test("Reference mode can import its ordered LoadImage inputs from Reference Infe
 
 test("text-only Direct UI disables visual modes and explains the fallback", () => {
   assert.match(mainSource, /function syncModeAvailability\(\)/);
-  assert.match(mainSource, /Text-only model · T2VA and Music3 available/);
+  assert.match(mainSource, /Text-only model · Image Create, T2VA and Music3 available/);
   assert.match(mainSource, /Switched to T2VA/);
   assert.match(mainSource, /if \(!generationModeIsAvailable\(\)\) return/);
   assert.match(stylesSource, /\.h3ps-modes button:disabled/);
