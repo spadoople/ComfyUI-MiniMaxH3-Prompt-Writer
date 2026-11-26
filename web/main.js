@@ -7,6 +7,8 @@ import { mediaVisualDescriptor } from "./media_visual.js";
 import { createSequenceWorkspace } from "./sequence_workspace.js";
 import { generateSequence, cancelSequence } from "./api/sequence.js";
 import { app } from "/scripts/app.js";
+import { api } from "/scripts/api.js";
+import { canvasImageSources, createCanvasImagePicker, readCanvasImageFiles } from "./canvas_image_picker.js";
 import { selectProjector, cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, importComfyInputMedia, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
 import { comfyVramIsAlreadyEmpty, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
 import { generateModelSummaryMarkup, settingsMarkup } from "./settings.js";
@@ -525,7 +527,9 @@ function renderMedia(mode) {
         <button type="button" data-media-filter="image" class="${filter === "image" ? "is-active" : ""}">${icon("image", 13)} Images <b>${counts.image || 0}/9</b></button>
         <button type="button" data-media-filter="video" class="${filter === "video" ? "is-active" : ""}">${icon("video", 13)} Video <b>${counts.video || 0}/3</b></button>
         <button type="button" data-media-filter="audio" class="${filter === "audio" ? "is-active" : ""}">${icon("audio", 13)} Audio <b>${counts.audio || 0}/3</b></button>
-        ${studio.mode === "Reference" ? `<button type="button" data-import-workflow-references ${studio.requestBusy ? "disabled" : ""}>Import workflow images</button>` : ""}
+        ${HOST_CAPABILITIES.workflowMedia && studio.mode === "Reference" ? `
+          <button type="button" data-import-canvas-images ${studio.requestBusy ? "disabled" : ""}>${icon("image", 13)} Import from canvas</button>
+          <button type="button" data-import-workflow-references ${studio.requestBusy ? "disabled" : ""}>Import workflow images</button>` : ""}
       </div>` : "";
     const addLabel = !isReference || filter === "image" ? "Add image" : filter === "video" ? "Add video" : filter === "audio" ? "Add audio" : "Add media";
     const canAdd = isReference || assets.length < data.limit;
@@ -668,6 +672,7 @@ function bindMediaActions(mode) {
   studio.root.querySelectorAll("[data-import-workflow-references]").forEach((button) => {
     button.addEventListener("click", () => importWorkflowReferences());
   });
+  media.querySelector("[data-import-canvas-images]")?.addEventListener("click", openCanvasImagePicker);
   studio.root.querySelectorAll("[data-asset-id]").forEach((card) => {
     card.addEventListener("dragstart", (event) => {
       if (studio.requestBusy) {
@@ -830,6 +835,36 @@ async function importWorkflowReferences() {
     renderMedia("Reference");
     showToast(error.code || "Workflow import failed", error.message);
   }
+}
+
+function canvasImageCapacity() {
+  const assets = studio.assets.filter(asset => asset.mode === "Reference");
+  const pictureCount = assets.filter(asset => asset.type === "image").length;
+  return { pictureCount, remaining: Math.max(0, Math.min(9 - pictureCount, 12 - assets.length)) };
+}
+
+function openCanvasImagePicker() {
+  if (studio.requestBusy || studio.mode !== "Reference") return;
+  studio.canvasImagePicker ??= createCanvasImagePicker({
+    root: studio.root,
+    viewUrl: route => api.apiURL(route),
+    getCapacity: canvasImageCapacity,
+    async onImport(sources) {
+      const revision = studio.canvasPickerWorkflowRevision;
+      if (workflowRevision !== revision) throw new Error("The workflow changed. Close the picker and open it again.");
+      const files = await readCanvasImageFiles(sources, route => api.fetchApi(route));
+      if (workflowRevision !== revision) throw new Error("The workflow changed. Close the picker and open it again.");
+      if (studio.requestBusy || studio.mode !== "Reference") throw new Error("Switch to Reference and wait for any Writer request to finish.");
+      const result = await uploadMedia(studio.sessionId, "Reference", files);
+      studio.sessionId = result.session_id;
+      studio.assets = [...studio.assets, ...result.assets];
+      studio.mediaFilter = "image";
+      renderMedia("Reference");
+      requestAnimationFrame(() => studio.root.querySelector("[data-import-canvas-images]")?.focus());
+    },
+  });
+  studio.canvasPickerWorkflowRevision = workflowRevision;
+  studio.canvasImagePicker.open(canvasImageSources(app));
 }
 
 function showToast(title, message, details = null, action = null, options = {}) {
@@ -4071,6 +4106,7 @@ function closeStudio() {
   const modal = studio.root.querySelector(".h3ps-modal");
   if (studio.mediaEditor?.close() === false) return false;
   if (studio.mediaComposer?.close() === false) return false;
+  if (studio.canvasImagePicker?.close() === false) return false;
   studio.sequence?.leave();
   studioFocusEpoch++;
   setSettingsOpen(false);
@@ -4207,6 +4243,7 @@ function installLauncher() {
 
 document.addEventListener("keydown", (event) => {
   if (!studio?.root.classList.contains("is-open")) return;
+  if (studio.canvasImagePicker?.isOpen()) return;
   const openComposer = studio.root.querySelector(".h3ps-composer.is-open");
   const openEditor = studio.root.querySelector(".h3ps-media-editor.is-open");
   if (event.key === "Tab") {

@@ -193,6 +193,8 @@ In Reference mode, open **Actions > Compose** to combine existing pictures and v
 
 ## Media panel
 
+In Single → Reference, select **Import from canvas** to reuse images from **Load Image** nodes and completed **Preview Image** or **Save Image** nodes in the current workflow. Select the thumbnails you want and use the arrows to set their Picture numbers. Writer appends them after any existing Pictures, within the Reference limits. Selecting nodes on the canvas before opening Writer preselects their images in the picker.
+
 Open **Media panel** from the Writer header or **Actions > Media panel**. It floats over the workflow without blocking the canvas. Drag its header to move it; the position is saved. Opening Writer temporarily hides the panel, and closing Writer brings it back.
 
 Drag media to empty canvas to create a Load Image, Load Video, or Load Audio node. Drop onto a compatible loader to replace its file without changing its connections. Supported targets are ComfyUI's **Load Image**, **Load Image (as Mask)**, **Load Video**, **Load Audio**, and Video Helper Suite's **Load Video (Upload)**. Other nodes are left unchanged.
