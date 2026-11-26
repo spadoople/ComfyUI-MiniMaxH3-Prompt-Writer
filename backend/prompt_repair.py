@@ -72,6 +72,8 @@ def audit_failures(audit: dict[str, Any]) -> list[str]:
         failures.append("generated draft is missing required reference tags: " + ", ".join(audit["missing_reference_tags"]))
     if audit.get("unexpected_reference_tags"):
         failures.append("unexpected reference tags: " + ", ".join(audit["unexpected_reference_tags"]))
+    if audit.get("video_format_in_image_prompt"):
+        failures.append("video formatting in a still-image prompt")
     if audit.get("unexpected_audio_task"):
         failures.append("audio reference/reuse declared without a canonically requested uploaded audio reference")
     failures.extend(audit.get("explicit_constraint_violations") or [])

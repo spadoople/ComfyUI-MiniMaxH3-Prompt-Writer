@@ -4,8 +4,9 @@ import re
 from typing import Any
 
 from .guides import MODE_GUIDES, guide_for_mode, load_guide, reference_base_excerpt
+from .image_modes import IMAGE_CREATE, IMAGE_EDIT, IMAGE_MODES
 from .media import STORE, MediaError, parse_session_id
-from .references import canonical_reference_tags
+from .references import canonical_reference_tags, reference_tags
 from .system_prompts import SystemPromptError, resolve_system_prompt
 from .text_normalization import normalize_unicode_text
 
@@ -61,11 +62,11 @@ def _validate_missing_media(text: str, field_label: str) -> None:
 
 
 def _validate_reference_tags(text: str, manifest: dict[str, Any], mode: str, field_label: str) -> None:
-    if mode != "Reference":
+    if mode != "Reference" and mode not in IMAGE_MODES:
         return
     _validate_missing_media(text, field_label)
     available = {asset["reference"] for asset in manifest["assets"]}
-    canonical_tags = canonical_reference_tags(text)
+    canonical_tags = reference_tags(text) if mode in IMAGE_MODES else canonical_reference_tags(text)
     missing = sorted(canonical_tags - available)
     if missing:
         tag = missing[0]
@@ -161,8 +162,71 @@ def _final_contract(mode: str, task_text: str) -> str:
     )
 
 
+def _assemble_image_request(
+    body: dict[str, Any], mode: str, *, refine: bool = False,
+    cached_generation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    system_prompt, custom = _effective_system_prompt(body, mode)
+    context = cached_generation if cached_generation and cached_generation.get("mode") == mode else body
+    brief = _required_text(context, "creative_brief", "Creative brief")
+    aspect_ratio = _required_text(context, "aspect_ratio", "Aspect ratio")
+    if aspect_ratio not in ASPECT_RATIOS:
+        raise AssemblyError("INVALID_ASPECT_RATIO", "The selected aspect ratio is not supported.")
+    try:
+        session_id = parse_session_id(body.get("session_id"))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise AssemblyError("INVALID_SESSION", "The media session ID is invalid.") from error
+    manifest = STORE.manifest(session_id, mode)
+    if not manifest["valid"]:
+        raise AssemblyError("INVALID_MEDIA_MANIFEST", "The media manifest is not valid.", manifest["violations"])
+    assets = manifest["assets"]
+    if mode == IMAGE_EDIT and not assets:
+        raise AssemblyError("IMAGE_REFERENCE_REQUIRED", "Add the base image before writing an edit prompt.")
+    _validate_reference_tags(brief, manifest, mode, "Creative Brief")
+    references = "\n".join(
+        f"{_media_line(asset)} — {'base image' if index == 0 else 'donor reference'}"
+        + (f", original size {asset['width']}×{asset['height']}" if asset.get("width") and asset.get("height") else "")
+        for index, asset in enumerate(assets)
+    ) or "None"
+    title = "Text to Image" if mode == IMAGE_CREATE else "Image Edit"
+    inputs = {"mode": mode, "duration_seconds": None, "aspect_ratio": aspect_ratio,
+              "creative_brief": brief, "media_manifest": manifest}
+    user_content = f"Task: {title}\nCanvas aspect ratio (width to height): {aspect_ratio}\n\nOrdered pictures:\n{references}\n\nCreative brief:\n{brief}"
+    if refine:
+        current = _required_text(body, "current_prompt", "Current prompt")
+        instruction = _required_text(body, "instruction", "Revision instruction")
+        if not body.get("ollama_model") and len(current) > 20_000:
+            raise AssemblyError("PROMPT_TOO_LONG", "The current prompt cannot exceed 20,000 characters.")
+        if not body.get("ollama_model") and len(instruction) > 2_000:
+            raise AssemblyError("INSTRUCTION_TOO_LONG", "The revision instruction cannot exceed 2,000 characters.")
+        _validate_reference_tags(instruction, manifest, mode, "Revision instruction")
+        _validate_missing_media(current, "Current prompt")
+        inputs.update(current_prompt=current, instruction=instruction)
+        user_content += (
+            f"\n\nCurrent prompt:\n{current}\n\nRevision instruction:\n{instruction}\n\n"
+            "Return the complete revised image prompt. Keep the current wording and reference roles outside the requested changes."
+        )
+    return {
+        "schema_version": 1,
+        "guide": {"id": "h3-image-" + ("create" if mode == IMAGE_CREATE else "edit"), "title": f"MiniMax H3 Image — {title}"},
+        "input": inputs,
+        "media_inputs": [
+            {"asset_id": asset["id"], "reference": asset["reference"], "type": "image",
+             "requires_capability": "images", "frames": [], "content_url": asset["content_url"],
+             "visual_width": asset.get("prepared_width"), "visual_height": asset.get("prepared_height")}
+            for asset in assets
+        ],
+        "supporting_guides": [],
+        "system_prompt": {"custom": custom, "content": system_prompt},
+        "messages": [{"role": "system", "name": "h3_image_contract", "content": system_prompt},
+                     {"role": "user", "content": user_content}],
+    }
+
+
 def assemble_request(body: dict[str, Any]) -> dict[str, Any]:
     mode = _required_text(body, "mode", "Mode")
+    if mode in IMAGE_MODES:
+        return _assemble_image_request(body, mode)
     if mode == MUSIC3_MODE:
         system_prompt, system_prompt_custom = _effective_system_prompt(body, mode)
         brief, lyrics = _validated_music_caption_context(body)
@@ -272,6 +336,8 @@ def assemble_refinement(
     cached_generation: dict[str, Any] | None,
 ) -> dict[str, Any]:
     mode = _required_text(body, "mode", "Mode")
+    if mode in IMAGE_MODES:
+        return _assemble_image_request(body, mode, refine=True, cached_generation=cached_generation)
     long_text = bool(body.get("ollama_model"))
     if mode == MUSIC3_MODE:
         system_prompt, system_prompt_custom = _effective_system_prompt(body, mode)

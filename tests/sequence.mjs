@@ -1,4 +1,5 @@
 import test from "node:test";
+import { isImageMode } from "../web/studio_state.js";
 import assert from "node:assert/strict";
 import { Window } from "happy-dom";
 import { readFile } from "node:fs/promises";
@@ -86,8 +87,9 @@ test("real DOM Add/Delete, shell sync and repeated workspace switches preserve D
   const window=new Window(); globalThis.document=window.document;
   const root=document.createElement("div");document.body.append(root);
   root.innerHTML=`<div data-workspace="video"></div><div data-video-modes></div><div data-music-inputs></div><span data-output-label></span><span data-output-mobile-label></span><textarea data-output>Single prompt</textarea><span data-copy-label></span><span data-refine-media-note></span><span data-refine-title></span><span data-refine-helper></span><textarea data-refine-instruction></textarea><div class="h3ps-workspace"><div data-video-inputs><div class="h3ps-section-actions"></div><div data-h3ps-media><div tabindex="0" data-asset-id="a"></div><div tabindex="0" data-asset-id="b"></div></div></div></div><button data-generate><span data-generate-label>Generate prompt</span></button>`;
+  root.insertAdjacentHTML("beforeend", "<nav data-image-modes></nav><label><input data-duration-slider></label><small data-visual-brief-hint></small>");
   const studio={root,mode:"T2VA"};
-  const context=vm.createContext({studio,rememberReferenceInsertTarget(){},toggleLyricsRefine(){},setMusicSystemPromptExpanded(){},syncModeAvailability(){}});
+  const context=vm.createContext({studio,isImageMode,rememberReferenceInsertTarget(){},toggleLyricsRefine(){},setMusicSystemPromptExpanded(){},syncModeAvailability(){}});
   vm.runInContext(main.match(/^function syncWorkspace\([^]*?^}/m)[0],context);
   const errors=[]; let busy=false, copied="";
   const assets=[{id:"a",filename:"portrait.png",type:"image",reference:"<Picture 7>"},{id:"b",filename:"room.png",type:"image",reference:"<Picture 8>"}];

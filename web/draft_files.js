@@ -1,6 +1,7 @@
 import { newSequence, newChunk } from "./sequence_state.js";
+import { IMAGE_MODES, VIDEO_MODES, isImageMode } from "./studio_state.js";
 
-const MODES = ["T2VA", "I2VA", "FL2VA", "L2VA", "Reference"];
+const MODES = [...VIDEO_MODES, ...IMAGE_MODES];
 const RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9"];
 function text(value, max = 8000) {
   if (typeof value !== "string" || value.length > max) throw Error("Invalid or oversized draft text.");
@@ -27,7 +28,7 @@ export function normalizeDraft(value) {
       copyFormat: { format: d.copyFormat?.format === "custom" ? "custom" : "prompts",
         template: text(d.copyFormat?.template ?? "{prompt}"), separator: text(d.copyFormat?.separator ?? "\n\n", 2000) } };
   } else if (value.kind === "single" && MODES.includes(d.mode)) {
-    content = { mode:d.mode, aspectRatio:d.aspectRatio, duration:seconds(d.duration,20),
+    content = { mode:d.mode, aspectRatio:d.aspectRatio, ...(!isImageMode(d.mode) ? { duration:seconds(d.duration,20) } : {}),
       brief:text(d.brief, Infinity), prompt:text(d.prompt,100000), instructions:d.instructions === null ? null : text(d.instructions, 32000) };
   } else throw Error("Unsupported draft type.");
   const media = Array.isArray(value.media) ? value.media.slice(0,100).map(n => text(n,2000)) : [];

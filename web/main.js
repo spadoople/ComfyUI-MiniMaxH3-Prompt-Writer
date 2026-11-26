@@ -8,7 +8,7 @@ import { createSequenceWorkspace } from "./sequence_workspace.js";
 import { generateSequence, cancelSequence } from "./api/sequence.js";
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
-import { canvasImageSources, createCanvasImagePicker, readCanvasImageFiles } from "./canvas_image_picker.js";
+import { canvasImageSources, conditioningImageSources, createCanvasImagePicker, readCanvasImageFiles } from "./canvas_image_picker.js";
 import { selectProjector, cancel, clearMedia, diagnoseGGUFRuntime, disconnectApiProvider, freeComfyVram, generate, getApiProviderModels, getApiProviderPresets, getGuides, getModels, getOllamaStatus, getStatus, getSystemPrompt, importComfyInputMedia, probeApiProvider, probeExternalServer, refine, removeMedia, reorderMedia, unloadModel, uploadMedia } from "./api/h3studio.js";
 import { comfyVramIsAlreadyEmpty, createSessionId, fileCountFromDataTransfer, insertReferenceAtCaret, isChoiceMenuInteraction, isGuideMenuInteraction, isRuntimeMenuInteraction, moveOntoTarget, replacementTargetForFileDrop, replaceEventListener, vramReleaseReachedTarget } from "./compat.js";
 import { generateModelSummaryMarkup, settingsMarkup } from "./settings.js";
@@ -21,7 +21,10 @@ import {
   audioWasAdded,
   clearPromptDraft,
   createStudioState,
+  IMAGE_MODES,
+  IMAGE_REFERENCE_LIMIT,
   isGenerationModeAvailable,
+  isImageMode,
   isPersistedDraftMode,
   isTextOnlyDirectModel,
   DEFAULT_OLLAMA_HOST,
@@ -39,6 +42,8 @@ import {
   saveUserPreferences,
   restoredModelAfterDiscovery,
   selectModelState,
+  systemPromptProfile,
+  VIDEO_MODES,
 } from "./studio_state.js";
 import { autoVramControlMarkup, createVramHandoffCoordinator, installVramHandoff, isLocalOllamaHost, releaseComfyVramWhenIdle, unloadWriterModels } from "./vram_handoff.js";
 import { createLazyMediaTool } from "./media_tools.js";
@@ -54,6 +59,7 @@ const vramHandoffCoordinator = createVramHandoffCoordinator();
 const INSTALLATION_GUIDE_URL = "https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/blob/main/docs/INSTALLATION.md";
 const TROUBLESHOOTING_GUIDE_URL = "https://github.com/duckyshell/ComfyUI-MiniMaxH3-Prompt-Writer/blob/main/docs/TROUBLESHOOTING.md";
 const MUSIC3_GUIDE_URL = "https://github.com/MiniMax-AI/MiniMax-Music3/tree/main/skills/music-caption-rewriter";
+const IMAGE_GUIDE_URL = "https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills/h3-image-prompt-writing/references";
 
 const MODES = {
   T2VA: {
@@ -85,6 +91,8 @@ const MODES = {
     hint: "Add up to 9 images, 3 videos and 3 audio files.",
     assets: [],
   },
+  ImageCreate: { title: "Text to image", hint: "Describe the finished still image.", limit: 0 },
+  ImageEdit: { title: "Image references", hint: "Picture 1 is the base image. Add up to 15 donor images.", limit: IMAGE_REFERENCE_LIMIT },
 };
 
 const MODE_DEFAULT_DRAFTS = {
@@ -268,7 +276,8 @@ async function syncSystemPromptEditor(profile) {
   const summaryStatus = studio.root.querySelector(`[data-system-prompt-summary-status="${profile}"]`);
   const reset = studio.root.querySelector(`[data-system-prompt-reset="${profile}"]`);
   const count = studio.root.querySelector(`[data-system-prompt-count="${profile}"]`);
-  const requestMode = profile === "music3_lyrics" ? "Music3Lyrics" : profile === "music3" ? "Music3" : profile === "reference" ? "Reference" : "T2VA";
+  const requestMode = isImageMode(profile) ? profile
+    : profile === "music3_lyrics" ? "Music3Lyrics" : profile === "music3" ? "Music3" : profile === "reference" ? "Reference" : "T2VA";
   textarea.disabled = true;
   if (!studio.systemPromptDefaults[profile]) {
     try {
@@ -299,12 +308,13 @@ function syncSystemPromptEditors() {
     syncSystemPromptEditor("reference"),
     syncSystemPromptEditor("music3"),
     syncSystemPromptEditor("music3_lyrics"),
+    ...IMAGE_MODES.map(syncSystemPromptEditor),
   ]);
 }
 
 function setSystemPromptProfile(profile) {
   if (!studio) return;
-  studio.settingsPromptProfile = profile === "reference" ? "reference" : "standard";
+  studio.settingsPromptProfile = profile === "reference" || isImageMode(profile) ? profile : "standard";
   studio.root.querySelectorAll("[data-system-prompt-profile]").forEach((button) => {
     const selected = button.dataset.systemPromptProfile === studio.settingsPromptProfile;
     button.classList.toggle("is-selected", selected);
@@ -509,12 +519,12 @@ function renderMedia(mode) {
     button.setAttribute("aria-selected", String(active));
   });
 
-  if (mode === "T2VA") {
+  if (mode === "T2VA" || mode === "ImageCreate") {
     media.innerHTML = `
       <div class="h3ps-empty-drop is-static">
         <span class="h3ps-empty-icon">${icon("spark", 20)}</span>
         <strong>Start from a text description</strong>
-        <small>T2VA does not use reference media</small>
+        <small>${mode === "ImageCreate" ? "Use Edit to work with reference images" : "T2VA does not use reference media"}</small>
       </div>`;
   } else {
     const isReference = mode === "Reference";
@@ -530,6 +540,13 @@ function renderMedia(mode) {
         ${HOST_CAPABILITIES.workflowMedia && studio.mode === "Reference" ? `
           <button type="button" data-import-canvas-images ${studio.requestBusy ? "disabled" : ""}>${icon("image", 13)} Import from canvas</button>
           <button type="button" data-import-workflow-references ${studio.requestBusy ? "disabled" : ""}>Import workflow images</button>` : ""}
+      </div>` : mode === "ImageEdit" ? `
+      <div class="h3ps-media-filters" aria-label="Image references">
+        <span>Pictures <b>${assets.length}/${IMAGE_REFERENCE_LIMIT}</b></span>
+        ${HOST_CAPABILITIES.workflowMedia ? `
+          <button type="button" data-import-canvas-images ${studio.requestBusy ? "disabled" : ""}>${icon("image", 13)} Import from canvas</button>
+          <button type="button" data-import-conditioning-images ${studio.requestBusy || assets.length ? "disabled" : ""}
+            title="${assets.length ? "Clear the current edit images to match the conditioning inputs exactly" : "Load pictures in the order they enter H3 Image Conditioning"}">Use conditioning inputs</button>` : ""}
       </div>` : "";
     const addLabel = !isReference || filter === "image" ? "Add image" : filter === "video" ? "Add video" : filter === "audio" ? "Add audio" : "Add media";
     const canAdd = isReference || assets.length < data.limit;
@@ -594,17 +611,23 @@ function insertSelectedReference(reference, assetId) {
 }
 
 function acceptMediaAssets(assets) {
-  const rewrite = referenceTextRemapper(studio.assets, assets);
   let missing = false;
-  const remap = text => {
-    const next = rewrite(text);
-    if (next !== text && /<Missing (Picture|Video|Audio) [1-9]\d*>/.test(next)) missing = true;
-    return next;
-  };
-  const saved = studio.modeDrafts.Reference;
-  if (saved) studio.modeDrafts.Reference = {...saved, brief:remap(saved.brief), prompt:remap(saved.prompt)};
-  // Sequence owns request-local labels. Only the separate Single draft is rewritten.
-  if (studio.mode === "Reference") {
+  function remapper(mode) {
+    const rewrite = referenceTextRemapper(studio.assets, assets, mode);
+    return text => {
+      const next = rewrite(text);
+      if (next !== text && /<Missing (Picture|Video|Audio) [1-9]\d*>/.test(next)) missing = true;
+      return next;
+    };
+  }
+  for (const mode of ["Reference", "ImageEdit"]) {
+    const saved = studio.modeDrafts[mode];
+    const remap = remapper(mode);
+    if (saved) studio.modeDrafts[mode] = { ...saved, brief: remap(saved.brief), prompt: remap(saved.prompt) };
+  }
+  // Sequence labels are request-local. Its saved Single draft is handled above.
+  if (studio.mode === "Reference" || studio.mode === "ImageEdit") {
+    const remap = remapper(studio.mode);
     for (const selector of ["[data-video-brief]", "[data-output]", "[data-refine-instruction]"]) {
       const input = studio.root.querySelector(selector), next = remap(input.value);
       if (next !== input.value) input.value = next;
@@ -672,7 +695,8 @@ function bindMediaActions(mode) {
   studio.root.querySelectorAll("[data-import-workflow-references]").forEach((button) => {
     button.addEventListener("click", () => importWorkflowReferences());
   });
-  media.querySelector("[data-import-canvas-images]")?.addEventListener("click", openCanvasImagePicker);
+  media.querySelector("[data-import-canvas-images]")?.addEventListener("click", () => openCanvasImagePicker());
+  media.querySelector("[data-import-conditioning-images]")?.addEventListener("click", () => openCanvasImagePicker(true));
   studio.root.querySelectorAll("[data-asset-id]").forEach((card) => {
     card.addEventListener("dragstart", (event) => {
       if (studio.requestBusy) {
@@ -727,6 +751,7 @@ function bindMediaActions(mode) {
   replaceEventListener(media, "drop", "media", async (event) => {
     event.preventDefault();
     if (studio.requestBusy) return;
+    if (mode === "ImageCreate") return;
     const sourceId = event.dataTransfer.getData("application/x-h3ps-asset") || studio.draggedAssetId;
     const targetId = event.target.closest("[data-asset-id]")?.dataset.assetId;
     studio.root.querySelectorAll(".is-file-replace-target").forEach((item) => item.classList.remove("is-file-replace-target"));
@@ -756,7 +781,7 @@ function previewAsset(asset) {
 function chooseMedia(mode, replaceAssetId = null) {
   const input = document.createElement("input");
   input.type = "file";
-  input.multiple = !replaceAssetId && (mode === "Reference" || mode === "FL2VA");
+  input.multiple = !replaceAssetId && (mode === "Reference" || mode === "FL2VA" || mode === "ImageEdit");
   input.accept = mode === "Reference" ? "image/*,video/*,audio/*" : "image/*";
   input.addEventListener("change", () => uploadFiles(mode, [...input.files], replaceAssetId));
   input.click();
@@ -837,34 +862,50 @@ async function importWorkflowReferences() {
   }
 }
 
-function canvasImageCapacity() {
-  const assets = studio.assets.filter(asset => asset.mode === "Reference");
+function canvasImageCapacity(mode) {
+  const assets = studio.assets.filter(asset => asset.mode === mode);
   const pictureCount = assets.filter(asset => asset.type === "image").length;
-  return { pictureCount, remaining: Math.max(0, Math.min(9 - pictureCount, 12 - assets.length)) };
+  const remaining = mode === "ImageEdit" ? IMAGE_REFERENCE_LIMIT - pictureCount : Math.min(9 - pictureCount, 12 - assets.length);
+  return { pictureCount, remaining: Math.max(0, remaining) };
 }
 
-function openCanvasImagePicker() {
-  if (studio.requestBusy || studio.mode !== "Reference") return;
+function openCanvasImagePicker(keepOrder = false) {
+  const mode = studio.mode;
+  if (studio.requestBusy || !["Reference", "ImageEdit"].includes(mode) || studio.canvasImagePicker?.isOpen()) return;
+  if (keepOrder && (mode !== "ImageEdit" || studio.assets.some(asset => asset.mode === mode))) return;
+  let sources;
+  try {
+    sources = keepOrder ? conditioningImageSources(app) : canvasImageSources(app);
+    if (keepOrder && sources.length > IMAGE_REFERENCE_LIMIT) throw new Error(`H3 Image supports up to ${IMAGE_REFERENCE_LIMIT} pictures.`);
+  } catch (error) {
+    showToast("Canvas import", error.message);
+    return;
+  }
   studio.canvasImagePicker ??= createCanvasImagePicker({
     root: studio.root,
     viewUrl: route => api.apiURL(route),
-    getCapacity: canvasImageCapacity,
+    getCapacity: () => canvasImageCapacity(studio.canvasPickerContext.mode),
     async onImport(sources) {
-      const revision = studio.canvasPickerWorkflowRevision;
-      if (workflowRevision !== revision) throw new Error("The workflow changed. Close the picker and open it again.");
+      const { revision, mode, keepOrder } = studio.canvasPickerContext;
+      function checkWorkflow() {
+        if (workflowRevision !== revision || (keepOrder && JSON.stringify(sources) !== JSON.stringify(conditioningImageSources(app)))) {
+          throw new Error("The workflow changed. Close the picker and open it again.");
+        }
+      }
+      checkWorkflow();
       const files = await readCanvasImageFiles(sources, route => api.fetchApi(route));
-      if (workflowRevision !== revision) throw new Error("The workflow changed. Close the picker and open it again.");
-      if (studio.requestBusy || studio.mode !== "Reference") throw new Error("Switch to Reference and wait for any Writer request to finish.");
-      const result = await uploadMedia(studio.sessionId, "Reference", files);
+      checkWorkflow();
+      if (studio.requestBusy || studio.mode !== mode) throw new Error("Return to the import mode and wait for any Writer request to finish.");
+      const result = await uploadMedia(studio.sessionId, mode, files);
       studio.sessionId = result.session_id;
       studio.assets = [...studio.assets, ...result.assets];
-      studio.mediaFilter = "image";
-      renderMedia("Reference");
+      if (mode === "Reference") studio.mediaFilter = "image";
+      renderMedia(mode);
       requestAnimationFrame(() => studio.root.querySelector("[data-import-canvas-images]")?.focus());
     },
   });
-  studio.canvasPickerWorkflowRevision = workflowRevision;
-  studio.canvasImagePicker.open(canvasImageSources(app));
+  studio.canvasPickerContext = { revision: workflowRevision, mode, keepOrder };
+  studio.canvasImagePicker.open(sources, { keepOrder });
 }
 
 function showToast(title, message, details = null, action = null, options = {}) {
@@ -907,6 +948,7 @@ function showToast(title, message, details = null, action = null, options = {}) 
 }
 
 function defaultModeDraft(mode) {
+  if (isImageMode(mode)) return { brief: "", prompt: "" };
   if (mode === "Music3") return MUSIC3_DEFAULT_DRAFT;
   if (mode === "Reference") {
     return { brief: REFERENCE_DEFAULT_BRIEF, prompt: SAMPLE_PROMPT };
@@ -1026,7 +1068,7 @@ function saveTextDraft() {
         c.exclusions.forEach(id => media.push(`Chunk ${i+1} excludes: ${name(id)}`));
       });
     }
-    const profile = mode === "Reference" ? "reference" : "standard";
+    const profile = systemPromptProfile(mode);
     const value = draftFile(sequence ? "sequence" : "single", sequence ? studio.sequence.state : {
       mode, ...currentDraftFields(), duration:studio.durationSeconds, aspectRatio:studio.aspectRatio,
       instructions:studio.customSystemPrompts[profile] ?? null,
@@ -1055,10 +1097,15 @@ async function loadTextDraft(value) {
       studio.sequence.loadDraft(value.content);
     } else {
       studio.sequence.setActive(false);
-      studio.mode=mode; studio.lastVideoMode=mode;
-      studio.durationSeconds=value.content.duration; studio.aspectRatio=value.content.aspectRatio; studio.aspectControl.update(studio.aspectRatio);
+      studio.mode = mode;
+      if (isImageMode(mode)) studio.lastImageMode = mode;
+      else {
+        studio.lastVideoMode = mode;
+        studio.durationSeconds = value.content.duration;
+      }
+      studio.aspectRatio=value.content.aspectRatio; studio.aspectControl.update(studio.aspectRatio);
       studio.modeDrafts[mode]={brief:value.content.brief,prompt:value.content.prompt};
-      const profile=mode === "Reference" ? "reference" : "standard";
+      const profile = systemPromptProfile(mode);
       if(value.content.instructions === null) delete studio.customSystemPrompts[profile];
       else studio.customSystemPrompts[profile]=value.content.instructions;
       saveCustomSystemPrompts(localStorage,studio.customSystemPrompts);
@@ -1123,27 +1170,35 @@ function restoreModeDraft(mode) {
 function syncWorkspace() {
   if (!studio) return;
   const music = studio.mode === "Music3";
+  const image = isImageMode(studio.mode);
   studio.root.classList.toggle("is-music", music);
+  studio.root.classList.toggle("is-image", image);
   studio.root.querySelectorAll("[data-workspace]").forEach((button) => {
-    const selected = button.dataset.workspace === (music ? "music" : "video");
+    const selected = button.dataset.workspace === (music ? "music" : image ? "image" : "video");
     button.classList.toggle("is-active", selected);
     button.setAttribute("aria-pressed", String(selected));
   });
-  studio.root.querySelector("[data-video-modes]").hidden = music;
+  studio.root.querySelector("[data-video-modes]").hidden = music || image;
+  studio.root.querySelector("[data-image-modes]").hidden = !image;
   studio.root.querySelector("[data-video-inputs]").hidden = music;
   studio.root.querySelector("[data-music-inputs]").hidden = !music;
+  studio.root.querySelector("[data-duration-slider]").closest("label").hidden = image;
+  studio.root.querySelector("[data-visual-brief-hint]").textContent = image
+    ? (studio.mode === "ImageEdit" ? "Describe what changes and what stays" : "Describe the finished still image")
+    : "Describe what should happen in the video";
   const outputLabel = music ? "Generated caption" : "Generated prompt";
   studio.root.querySelector("[data-output-label]").textContent = outputLabel;
   studio.root.querySelector("[data-output-mobile-label]").textContent = outputLabel;
   studio.root.querySelector("[data-output]").setAttribute("aria-label", outputLabel);
   studio.root.querySelector("[data-copy-label]").textContent = music ? "Copy caption" : "Copy prompt";
   studio.root.querySelector("[data-generate-label]").textContent = music ? "Generate caption" : "Generate prompt";
-  studio.root.querySelector("[data-refine-media-note]").textContent = music ? "Lyrics stay separate" : "No media re-upload";
+  studio.root.querySelector("[data-refine-media-note]").textContent = music ? "Lyrics stay separate" : image ? "Uses your current image references" : "No media re-upload";
   studio.root.querySelector("[data-refine-title]").textContent = music ? "Refine caption" : "Refine prompt";
   studio.root.querySelector("[data-refine-helper]").textContent = music ? "Describe the musical change" : "Describe only what should change";
   studio.root.querySelector("[data-refine-instruction]").placeholder = music
     ? "For example: keep the verses sparse and let the final chorus open wider."
-    : "For example: make the camera movement slower and keep the ending more ambiguous.";
+    : image ? "For example: soften the lighting and keep the lettering exactly as written."
+      : "For example: make the camera movement slower and keep the ending more ambiguous.";
   if (studio.mode !== "Music3") rememberReferenceInsertTarget(studio.root.querySelector("[data-output]"));
   else referenceInsertTarget = null;
 
@@ -1164,9 +1219,9 @@ function syncModeAvailability() {
     const unavailable = !isGenerationModeAvailable(studio.selectedModel, control.dataset.mode);
     control.disabled = studio.requestBusy || unavailable;
     control.setAttribute("aria-disabled", String(control.disabled));
-    control.title = unavailable && textOnlyDirect
+    control.title = unavailable ? (textOnlyDirect
       ? "This Direct GGUF is text-only. Add its matching mmproj to enable visual modes."
-      : "";
+      : "Select a vision-capable prompt model to edit images.") : "";
   });
   studio.root.querySelectorAll("[data-workspace]").forEach((control) => {
     control.disabled = studio.requestBusy;
@@ -1177,9 +1232,13 @@ function syncModeAvailability() {
 
 function generationModeIsAvailable() {
   if (isGenerationModeAvailable(studio.selectedModel, studio.mode)) return true;
+  if (studio.mode === "ImageEdit") {
+    showToast("Vision model required", "Select a vision-capable prompt model for Image Edit.");
+    return false;
+  }
   showToast(
     "Text-only Direct GGUF",
-    "Use T2VA or Music3, or add the matching mmproj to enable visual modes.",
+    "Use T2VA, Image Create or Music 3, or add the matching mmproj to enable visual modes.",
   );
   return false;
 }
@@ -2233,7 +2292,7 @@ function renderInferenceSettings() {
       : runtimeRequirement.state === "update_required"
         ? renderDirectModelRuntimeUpdate(directModel)
         : isTextOnlyDirectModel(directModel)
-          ? `<div class="h3ps-direct-model-note"><strong>Text-only model · T2VA and Music3 available</strong><span>${escapeHtml(directModel.capability_message || "No compatible vision projector is active.")}</span></div>`
+          ? `<div class="h3ps-direct-model-note"><strong>Text-only model · Image Create, T2VA and Music3 available</strong><span>${escapeHtml(directModel.capability_message || "No compatible vision projector is active.")}</span></div>`
           : "";
   } else {
     directStatus.innerHTML = "";
@@ -2325,7 +2384,7 @@ function selectModel(model, { preserveSettingsProvider = false } = {}) {
   studio.modelSelectionRevision = (studio.modelSelectionRevision || 0) + 1;
   rememberRuntimePreferences();
   selectModelState(studio, model, { preserveSettingsProvider });
-  const switchedToT2VA = !isGenerationModeAvailable(model, studio.mode);
+  const switchedToT2VA = !isImageMode(studio.mode) && !isGenerationModeAvailable(model, studio.mode);
   if (switchedToT2VA) {
     stashCurrentModeDraft();
     studio.mode = "T2VA";
@@ -3264,6 +3323,7 @@ function createStudio() {
         </div>
         <nav class="h3ps-workspaces" aria-label="Writer workspace">
           <button type="button" data-workspace="video">H3 Video</button>
+          <button type="button" data-workspace="image">H3 Image</button>
           <button type="button" data-workspace="music">Music 3</button>
         </nav>
         <div class="h3ps-header-meta">
@@ -3291,7 +3351,11 @@ function createStudio() {
 
       <div class="h3ps-workspace-toolbar" data-generate-view>
         <nav class="h3ps-modes" role="tablist" aria-label="Generation mode" data-video-modes>
-          ${Object.keys(MODES).map((mode) => `<button type="button" role="tab" data-mode="${mode}">${mode}</button>`).join("")}
+          ${VIDEO_MODES.map((mode) => `<button type="button" role="tab" data-mode="${mode}">${mode}</button>`).join("")}
+        </nav>
+        <nav class="h3ps-modes" role="tablist" aria-label="Image mode" data-image-modes hidden>
+          <button type="button" role="tab" data-mode="ImageCreate">Create</button>
+          <button type="button" role="tab" data-mode="ImageEdit">Edit</button>
         </nav>
         <div class="h3ps-output-toolbar">
           <span data-output-label>Generated prompt</span>
@@ -3330,7 +3394,7 @@ function createStudio() {
           </div>
 
           <label class="h3ps-brief">
-            <span><strong>Creative brief</strong><small>Describe what should happen in the video</small></span>
+            <span><strong>Creative brief</strong><small data-visual-brief-hint>Describe what should happen in the video</small></span>
             <textarea spellcheck="true" data-video-brief>Use identity and wardrobe from Picture 1 and the slow lateral camera movement from Video 1. A solitary character waits at a rain-soaked tram stop at blue hour, notices an approaching light and turns into the wind. End on a quiet, unresolved look; keep the shot cinematic, realistic and restrained.</textarea>
             <small class="h3ps-char-count">0 characters</small>
           </label>
@@ -3540,30 +3604,27 @@ function createStudio() {
     }
     if (!event.target.closest("[data-clear-control]")) setClearMenuOpen(false);
   });
-  root.querySelectorAll("[data-workspace]").forEach((button) => button.addEventListener("click", () => {
-    const nextMode = button.dataset.workspace === "music" ? "Music3" : studio.lastVideoMode;
-    if (!isGenerationModeAvailable(studio.selectedModel, nextMode)) return;
-    if (nextMode === studio.mode) return;
+  function switchMode(mode) {
+    if (studio.requestBusy || mode === studio.mode || !isGenerationModeAvailable(studio.selectedModel, mode)) return;
     stashCurrentModeDraft();
-    if (studio.mode !== "Music3") studio.lastVideoMode = studio.mode;
-    studio.mode = nextMode;
+    studio.mode = mode;
+    if (isImageMode(mode)) studio.lastImageMode = mode;
+    else if (VIDEO_MODES.includes(mode)) studio.lastVideoMode = mode;
+    if (isImageMode(mode) || mode === "Music3") studio.sequence?.setActive(false);
     syncWorkspace();
-    restoreModeDraft(studio.mode);
-    renderMedia(studio.mode);
+    restoreModeDraft(mode);
+    renderMedia(mode);
     syncRuntimeSummary();
     saveUserPreferences(localStorage, studio);
+  }
+  root.querySelectorAll("[data-workspace]").forEach((button) => button.addEventListener("click", () => {
+    const workspace = button.dataset.workspace;
+    const mode = workspace === "music" ? "Music3" : workspace === "image" ? studio.lastImageMode : studio.lastVideoMode;
+    const fallback = workspace === "image" ? "ImageCreate" : "T2VA";
+    switchMode(isGenerationModeAvailable(studio.selectedModel, mode) ? mode : fallback);
   }));
   root.querySelectorAll("[data-mode]").forEach((button) => button.addEventListener("click", () => {
-    if (!isGenerationModeAvailable(studio.selectedModel, button.dataset.mode)) return;
-    if (button.dataset.mode === studio.mode) return;
-    stashCurrentModeDraft();
-    studio.mode = button.dataset.mode;
-    studio.lastVideoMode = studio.mode;
-    syncWorkspace();
-    restoreModeDraft(studio.mode);
-    renderMedia(studio.mode);
-    syncRuntimeSummary();
-    saveUserPreferences(localStorage, studio);
+    switchMode(button.dataset.mode);
   }));
   root.querySelector("[data-open-settings-header]").addEventListener("click", () => setSettingsOpen(true));
   root.querySelector("[data-open-settings]").addEventListener("click", () => setSettingsOpen(true));
@@ -3633,6 +3694,10 @@ function createStudio() {
     if (menu.hidden) return;
     if (studio.mode === "Music3") {
       menu.innerHTML = `<a href="${MUSIC3_GUIDE_URL}" target="_blank" rel="noopener noreferrer"><strong>Music Caption Rewriter</strong><small>Official MiniMax Music 3 guide</small></a>`;
+      return;
+    }
+    if (isImageMode(studio.mode)) {
+      menu.innerHTML = `<a href="${IMAGE_GUIDE_URL}" target="_blank" rel="noopener noreferrer"><strong>MiniMax H3 Image prompt guides</strong><small>Text to image and image editing</small></a>`;
       return;
     }
     try {

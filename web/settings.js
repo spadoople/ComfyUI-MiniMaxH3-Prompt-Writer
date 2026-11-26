@@ -114,10 +114,20 @@ export function settingsMarkup(icon) {
               <span><strong>Reference</strong><small>Reference mode</small></span>
               <span><em data-system-prompt-summary-status="reference">Default</em><b>Edit</b>${icon("chevron", 12)}</span>
             </button>
+            <button type="button" data-system-prompt-profile="ImageCreate">
+              <span><strong>H3 Image Create</strong><small>Text to Image</small></span>
+              <span><em data-system-prompt-summary-status="ImageCreate">Default</em><b>Edit</b>${icon("chevron", 12)}</span>
+            </button>
+            <button type="button" data-system-prompt-profile="ImageEdit">
+              <span><strong>H3 Image Edit</strong><small>Reference images</small></span>
+              <span><em data-system-prompt-summary-status="ImageEdit">Default</em><b>Edit</b>${icon("chevron", 12)}</span>
+            </button>
           </div>
           <div class="h3ps-system-prompt-editor" data-system-prompt-editor hidden>
             ${systemPromptPanel("standard", "Standard", "Instructions used by T2VA, I2VA, FL2VA and L2VA.", icon)}
             ${systemPromptPanel("reference", "Reference", "Instructions used by Reference mode.", icon, true)}
+            ${systemPromptPanel("ImageCreate", "H3 Image Create", "Instructions used for text-to-image prompts.", icon, true)}
+            ${systemPromptPanel("ImageEdit", "H3 Image Edit", "Instructions used for image edit prompts.", icon, true)}
           </div>
           <div class="h3ps-draft-defaults-action" data-draft-defaults-action>
             <button type="button" data-restore-default-drafts>${icon("refresh", 13)}<span data-restore-default-drafts-label>Restore default drafts</span></button>
